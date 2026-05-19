@@ -32,7 +32,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QTextEdit, QSpinBox,
     QCheckBox, QDateEdit, QRadioButton, QButtonGroup,
     QFileDialog, QTableWidget, QTableWidgetItem,
-    QHeaderView, QProgressBar, QMessageBox, QSizePolicy
+    QHeaderView, QProgressBar, QMessageBox, QSizePolicy, QScrollArea
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject, QDate, QTimer
 from PyQt5.QtGui import QFont, QColor, QTextCursor
@@ -269,17 +269,28 @@ def _config_path(filename: str = "config.json") -> str:
 
 def save_delivery_config(keyword: str = "", location: str = "", min_score: int = 60,
                          target: int = 10, delay_min: int = 8, delay_max: int = 15,
-                         delivery_mode: str = "api", use_greeting: bool = False):
-    """保存投递配置到 config.json"""
+                         delivery_mode: str = "api", use_greeting: bool = False,
+                         resume_text: str = ""):
+    """保存投递配置到 config.json（含简历文本）"""
+    # 先加载已有数据（保留 resume_text 等不被覆盖）
+    existing = {}
+    try:
+        p = _config_path("config.json")
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+    except Exception:
+        pass
     data = {
-        "keyword": keyword,
-        "location": location,
-        "min_score": min_score,
-        "target": target,
-        "delay_min": delay_min,
-        "delay_max": delay_max,
-        "delivery_mode": delivery_mode,
-        "use_greeting": use_greeting,
+        "keyword": keyword or existing.get("keyword", ""),
+        "location": location or existing.get("location", ""),
+        "min_score": min_score if min_score != 60 or not existing else existing.get("min_score", 60),
+        "target": target if target != 10 or not existing else existing.get("target", 10),
+        "delay_min": delay_min if delay_min != 8 or not existing else existing.get("delay_min", 8),
+        "delay_max": delay_max if delay_max != 15 or not existing else existing.get("delay_max", 15),
+        "delivery_mode": delivery_mode or existing.get("delivery_mode", "api"),
+        "use_greeting": use_greeting if use_greeting else existing.get("use_greeting", False),
+        "resume_text": resume_text or existing.get("resume_text", ""),
     }
     try:
         with open(_config_path("config.json"), "w", encoding="utf-8") as f:
@@ -298,6 +309,16 @@ def load_delivery_config() -> dict:
     except Exception:
         pass
     return {}
+
+def save_resume_text(resume_text: str):
+    """仅保存简历文本到 config.json（保留其他配置）"""
+    existing = load_delivery_config()
+    existing["resume_text"] = resume_text
+    try:
+        with open(_config_path("config.json"), "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def save_user_credentials(username: str, password: str):
@@ -2862,7 +2883,18 @@ class AccountTab(QWidget):
         self._init_ui()
 
     def _init_ui(self):
-        layout = QVBoxLayout(self)
+        # 外层滚动区域
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        outer_layout.addWidget(scroll)
+
+        content = QWidget()
+        content.setMinimumWidth(420)
+        scroll.setWidget(content)
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
@@ -3099,6 +3131,8 @@ class ResumeTab(QWidget):
                 if industries:
                     lines.append(f"行业方向：{', '.join(industries)}")
                 self.analysis_text.setText('\n\n'.join(lines) if lines else str(result))
+                # 自动保存简历文本，下次启动自动恢复
+                save_resume_text(self.analyzer.resume_text)
             else:
                 self.analysis_text.setText("分析失败，请检查网络连接和API密钥")
         except Exception as e:
@@ -3581,7 +3615,19 @@ class AutoDeliveryTab(QWidget):
         self._init_ui()
 
     def _init_ui(self):
-        layout = QVBoxLayout(self)
+        # 外层滚动区域 —— 窗口缩窄时出现滚动条而非压缩控件
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        outer_layout.addWidget(scroll)
+
+        content = QWidget()
+        content.setMinimumWidth(880)
+        scroll.setWidget(content)
+        layout = QVBoxLayout(content)
         layout.setSpacing(6)
         layout.setContentsMargins(8, 8, 8, 8)
 
@@ -3593,7 +3639,7 @@ class AutoDeliveryTab(QWidget):
         param_grid.setColumnStretch(0, 0)
         param_grid.setColumnStretch(1, 1)
         param_grid.setColumnMinimumWidth(0, 60)
-        FIELD_MIN_W = 180
+        FIELD_MIN_W = 200
 
         row = 0
 
@@ -3863,6 +3909,12 @@ class AutoDeliveryTab(QWidget):
         dmax = self.delay_max_spin.value()
         use_greeting = self.greeting_check.isChecked() and is_browser
 
+        # 简历文本检查
+        if not self.analyzer or not self.analyzer.resume_text:
+            _log_emitter.log_signal.emit(_log_fmt("警告",
+                "未检测到简历文本！将使用默认匹配度50分，所有岗位均低于筛选线可能被跳过。"
+                "请先在「简历管理」页签上传简历并点击「开始AI分析」"))
+
         # 保存投递配置
         self._save_config(keyword=keyword, location=location, min_score=min_score,
                           target=target, delay_min=dmin, delay_max=dmax,
@@ -3889,11 +3941,12 @@ class AutoDeliveryTab(QWidget):
         if is_browser:
             try:
                 co = ChromiumOptions()
-                co.set_argument('--start-maximized')
                 co.set_argument('--no-sandbox')
                 co.set_argument('--disable-blink-features=AutomationControlled')
                 co.set_argument('--disable-dev-shm-usage')
                 co.set_argument('--disable-gpu')
+                co.set_argument('--window-position=-32000,-32000')  # 窗口移到屏幕外，后台运行
+                co.set_argument('--window-size=1280,800')
                 page = ChromiumPage(co)
                 browser_deliverer = BossBrowserDeliverer(page, self.analyzer)
                 self._browser_deliverer = browser_deliverer
@@ -4080,7 +4133,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("BOSS直聘智能投递助手 v2.0")
         self.setGeometry(100, 100, 1100, 750)
-        self.setMinimumSize(1000, 680)
+        self.setMinimumSize(1050, 700)
 
         # 初始化数据库
         self.account_db = AccountDatabase()
@@ -4093,6 +4146,16 @@ class MainWindow(QMainWindow):
 
         # 初始化AI分析器
         self.analyzer = ResumeAnalyzer()
+
+        # 自动恢复简历文本（上次AI分析时保存的）
+        try:
+            cfg = load_delivery_config()
+            if cfg.get("resume_text"):
+                self.analyzer.resume_text = cfg["resume_text"]
+                self.analyzer.resume_content = cfg["resume_text"]
+                print(f"[系统] 已从配置恢复简历文本 ({len(cfg['resume_text'])}字符)")
+        except Exception:
+            pass
 
         # 初始化API客户端
         self.api_client = BOSSApiClient()
@@ -4178,30 +4241,25 @@ def main():
     app.setStyle('Fusion')
 
     # 全局字体
-    font = QFont("Microsoft YaHei", 10)
+    font = QFont("Microsoft YaHei", 9)
     app.setFont(font)
 
     # ── 全局 QSS 样式表 ──
     app.setStyleSheet("""
-    /* 全局背景 */
-    QWidget {
-        color: #1e293b;
-    }
-
     /* QGroupBox — 白底卡片 */
     QGroupBox {
         background: #ffffff;
         border: 1px solid #e2e8f0;
         border-radius: 8px;
-        margin-top: 12px;
-        padding: 12px 8px 8px 8px;
+        margin-top: 10px;
+        padding: 10px 6px 6px 6px;
         font-weight: bold;
         color: #1e293b;
     }
     QGroupBox::title {
         subcontrol-origin: margin;
-        left: 16px;
-        padding: 0 8px;
+        left: 14px;
+        padding: 0 6px;
     }
 
     /* QPushButton */
@@ -4210,7 +4268,7 @@ def main():
         color: white;
         border: none;
         border-radius: 6px;
-        padding: 8px 20px;
+        padding: 7px 16px;
         font-weight: bold;
     }
     QPushButton:hover { background-color: #3b5de7; }
@@ -4225,13 +4283,13 @@ def main():
         gridline-color: #f1f5f9;
         alternate-background-color: #f8fafc;
     }
-    QTableWidget::item { padding: 4px 8px; }
+    QTableWidget::item { padding: 3px 6px; }
     QTableWidget::item:selected { background: #eef2ff; color: #1e293b; }
     QHeaderView::section {
         background: #f1f5f9;
         border: none;
         border-bottom: 2px solid #e2e8f0;
-        padding: 6px 8px;
+        padding: 4px 6px;
         font-weight: bold;
         color: #475569;
     }
@@ -4240,11 +4298,9 @@ def main():
     QLineEdit, QSpinBox, QDateEdit {
         border: 1px solid #e2e8f0;
         border-radius: 4px;
-        padding: 4px 8px;
-        min-height: 28px;
+        padding: 3px 6px;
         background: #ffffff;
         color: #1e293b;
-        font-size: 13px;
     }
     QLineEdit:focus, QSpinBox:focus, QDateEdit:focus {
         border-color: #4a6cf7;
@@ -4259,7 +4315,7 @@ def main():
     QTabBar::tab {
         background: #e2e8f0;
         color: #64748b;
-        padding: 8px 20px;
+        padding: 6px 16px;
         margin-right: 2px;
         border-radius: 6px 6px 0 0;
         font-weight: bold;
@@ -4285,7 +4341,7 @@ def main():
     }
 
     /* QCheckBox / QRadioButton */
-    QCheckBox, QRadioButton { color: #1e293b; spacing: 8px; }
+    QCheckBox, QRadioButton { color: #1e293b; spacing: 6px; }
     """)
 
     window = MainWindow()
