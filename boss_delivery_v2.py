@@ -2052,7 +2052,7 @@ class ResumeAnalyzer:
 
     def calculate_match_score(self, resume_text, job_title, job_detail, company_name=""):
         """AI计算简历与岗位的匹配度"""
-        prompt = f"""请严格以专业HR视角，量化分析简历与岗位的匹配程度。
+        prompt = f"""请以专业HR视角，公正评估简历与岗位的匹配程度。注意：只要岗位方向与候选人背景大致对口，基础分就应在50-65之间；技能和经验有较多重叠时应在65-80之间；高度吻合时80以上。
 
 【简历内容】
 {resume_text[:2500]}
@@ -2071,15 +2071,15 @@ class ResumeAnalyzer:
 5. 综合匹配：综合以上维度加权计算（非简单平均，技能和职责权重最高）
 
 【评分标准】
-0-20: 完全不匹配 | 20-40: 匹配度低 | 40-60: 勉强匹配 | 60-75: 基本匹配 | 75-90: 高度匹配 | 90-100: 完美匹配
+0-30: 完全不搭边 | 30-50: 匹配度较低 | 50-65: 大致对口 | 65-80: 匹配良好 | 80-100: 高度匹配
 
 请以JSON格式返回：
 {{
-    "score": 85,
-    "skill_score": 80,
-    "experience_score": 75,
-    "industry_score": 70,
-    "duty_score": 90,
+    "score": 72,
+    "skill_score": 70,
+    "experience_score": 68,
+    "industry_score": 65,
+    "duty_score": 75,
     "reasons": ["简历中的XXX技能与岗位要求的XXX高度吻合", "有N年XXX行业经验，符合岗位行业偏好"],
     "concerns": ["岗位要求XXX，但简历中未体现相关经验"],
     "job_requirements": ["技能要求1", "技能要求2"],
@@ -2095,7 +2095,7 @@ score为综合匹配度0-100整数。reasons为匹配点列表。concerns为不�
             response = self.client.chat.completions.create(
                 model=DEEPSEEK_MODEL,
                 messages=[
-                    {"role": "system", "content": "你是专业的HR，擅长评估简历与岗位的匹配程度。请客观、准确地进行评估。"},
+                    {"role": "system", "content": "你是专业HR，擅长公正评估简历与岗位匹配度。评分时注意：只要方向对口就有基础分50-65，不要过于严苛，大多数真实投递场景的分数集中在55-80分之间。"},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.3,
@@ -3188,9 +3188,13 @@ class RecordTab(QWidget):
         self.record_table.setAlternatingRowColors(True)
         header = self.record_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Interactive)
+        header.setSectionResizeMode(6, QHeaderView.Fixed)
+        header.setSectionResizeMode(7, QHeaderView.Fixed)
+        self.record_table.setColumnWidth(1, 80)
+        self.record_table.setColumnWidth(6, 70)
+        self.record_table.setColumnWidth(7, 120)
+        self.record_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.record_table.setMinimumHeight(200)
         layout.addWidget(self.record_table, stretch=1)
 
@@ -3787,26 +3791,27 @@ class AutoDeliveryTab(QWidget):
         header = self.job_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.Interactive)
-        header.setSectionResizeMode(3, QHeaderView.Interactive)
-        header.setSectionResizeMode(4, QHeaderView.Interactive)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.Fixed)
+        header.setSectionResizeMode(4, QHeaderView.Fixed)
+        header.setSectionResizeMode(5, QHeaderView.Fixed)
+        header.setSectionResizeMode(6, QHeaderView.Fixed)
+        header.setSectionResizeMode(7, QHeaderView.Fixed)
         header.setSectionResizeMode(8, QHeaderView.Stretch)
-        header.setSectionResizeMode(9, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(10, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(9, QHeaderView.Fixed)
+        header.setSectionResizeMode(10, QHeaderView.Fixed)
         header.setStretchLastSection(False)
-        self.job_table.setColumnWidth(1, 100)
-        self.job_table.setColumnWidth(2, 60)
-        self.job_table.setColumnWidth(3, 80)
-        self.job_table.setColumnWidth(4, 80)
-        self.job_table.setColumnWidth(5, 70)
-        self.job_table.setColumnWidth(6, 55)
-        self.job_table.setColumnWidth(7, 100)
-        self.job_table.setColumnWidth(9, 60)
-        self.job_table.setColumnWidth(10, 65)
+        self.job_table.setColumnWidth(1, 80)
+        self.job_table.setColumnWidth(2, 50)
+        self.job_table.setColumnWidth(3, 65)
+        self.job_table.setColumnWidth(4, 65)
+        self.job_table.setColumnWidth(5, 55)
+        self.job_table.setColumnWidth(6, 48)
+        self.job_table.setColumnWidth(7, 70)
+        self.job_table.setColumnWidth(9, 50)
+        self.job_table.setColumnWidth(10, 50)
         self.job_table.setMinimumHeight(180)
+        self.job_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.job_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.job_table, stretch=1)
 
