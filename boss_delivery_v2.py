@@ -2067,7 +2067,7 @@ class ResumeAnalyzer:
 
             elapsed = time.time() - t0
             result = response.choices[0].message.content
-            self._log(f"简历分析响应成功 (耗时 {elapsed:.1f}s): {result[:150]}...")
+            self._log(f"简历分析响应成功 (耗时 {elapsed:.1f}s): {result}")
 
             try:
                 json_start = result.find('{')
@@ -2086,7 +2086,8 @@ class ResumeAnalyzer:
             return None
 
     def calculate_match_score(self, resume_text, job_title, job_detail, company_name=""):
-        """AI计算简历与岗位的匹配度"""
+        """AI计算简历与岗位的匹配度（每次调用使用独立请求ID，确保无上下文污染）"""
+        request_id = uuid.uuid4().hex[:8]
         prompt = f"""请以专业HR视角，公正评估简历与岗位的匹配程度。注意：只要岗位方向与候选人背景大致对口，基础分就应在50-65之间；技能和经验有较多重叠时应在65-80之间；高度吻合时80以上。
 
 【简历内容】
@@ -2122,24 +2123,24 @@ class ResumeAnalyzer:
 }}
 
 score为综合匹配度0-100整数。reasons为匹配点列表。concerns为不匹配/风险点列表。analysis为50字内综合判断。
-"""
+请求ID: {request_id}"""
         try:
-            self._log(f"请求匹配度: {job_title} @ {company_name} (模型: {DEEPSEEK_MODEL})")
+            self._log(f"请求匹配度: {job_title} @ {company_name} (模型: {DEEPSEEK_MODEL}, rid={request_id})")
             t0 = time.time()
 
             response = self.client.chat.completions.create(
                 model=DEEPSEEK_MODEL,
                 messages=[
-                    {"role": "system", "content": "你是专业HR，擅长公正评估简历与岗位匹配度。评分时注意：只要方向对口就有基础分50-65，不要过于严苛，大多数真实投递场景的分数集中在55-80分之间。"},
+                    {"role": "system", "content": f"你是专业HR，擅长公正评估简历与岗位匹配度。每次评估独立进行，不受历史评估影响。评分时注意：只要方向对口就有基础分50-65，不要过于严苛，大多数真实投递场景的分数集中在55-80分之间。本次评估ID: {request_id}"},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.3,
+                temperature=0.5,
                 max_tokens=1024,
             )
 
             elapsed = time.time() - t0
             result = response.choices[0].message.content
-            self._log(f"匹配度响应成功 (耗时 {elapsed:.1f}s): {result[:150]}...")
+            self._log(f"匹配度响应成功 (耗时 {elapsed:.1f}s): {result}")
 
             try:
                 json_start = result.find('{')
