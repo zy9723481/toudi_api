@@ -254,6 +254,25 @@ class LogEmitter(QObject):
 
 _log_emitter = LogEmitter()
 
+# 脚本所在目录（PyInstaller打包后为exe所在目录）
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def setup_file_logging():
+    """将日志信号同时写入脚本目录下的日志文件（每次启动覆盖）"""
+    log_path = os.path.join(SCRIPT_DIR, "boss_delivery.log")
+    try:
+        fh = open(log_path, 'w', encoding='utf-8')
+        def _write_to_file(msg: str):
+            try:
+                fh.write(msg + '\n')
+                fh.flush()
+            except Exception:
+                pass
+        _log_emitter.log_signal.connect(_write_to_file)
+    except Exception:
+        pass  # 写文件失败不影响主流程
+
 
 def _log_fmt(prefix: str, msg: str) -> str:
     ts = datetime.now().strftime('%H:%M:%S')
@@ -1884,18 +1903,34 @@ class BOSSApiClient:
         return True
 
     def fetch_jobs(self, keyword: str = "", location: str = "", page: int = 1) -> Dict:
-        """获取岗位列表（真实API，Cookie未设置时返回空）"""
+        """获取岗位列表（真实API，Cookie未设置时返回空）
+        多关键字以空格分隔，客户端二次筛选：岗位标题必须包含所有关键字
+        """
         if not self.cookies:
             self._log("未设置Cookie，无法获取岗位")
             return {}
 
+        # 解析多关键字
+        keywords = [k.strip() for k in (keyword or "").split() if k.strip()]
         self._log(f"获取岗位列表: 关键词={keyword or '全部'}, 地区={location or '全国'}, 页码={page}")
 
         result = self._fetch_jobs_real(keyword=keyword, location=location, page=page)
-        if result is not None:
-            return result
-        self._log("真实API获取岗位失败，请检查Cookie是否有效")
-        return {}
+        if result is None:
+            self._log("真实API获取岗位失败，请检查Cookie是否有效")
+            return {}
+
+        # 多关键字AND筛选：标题必须包含所有关键字
+        if len(keywords) > 1 and result:
+            filtered = {}
+            for url, job in result.items():
+                title = job.get("title", "")
+                if all(kw.lower() in title.lower() for kw in keywords):
+                    filtered[url] = job
+            skipped = len(result) - len(filtered)
+            if skipped > 0:
+                self._log(f"多关键字筛选: {len(result)}个→{len(filtered)}个（需同时包含{' + '.join(keywords)}，过滤{skipped}个）")
+            return filtered
+        return result
 
     def deliver_job(self, job_url: str, greeting: str = "", job_data: Dict = None) -> bool:
         """投递岗位/打招呼（仅真实API，无模拟降级）
@@ -3670,7 +3705,7 @@ class AutoDeliveryTab(QWidget):
         # --- 岗位关键字 ---
         param_grid.addWidget(QLabel("关键字："), row, 0)
         self.keyword_input = QLineEdit()
-        self.keyword_input.setPlaceholderText("例如：软件测试、Python开发")
+        self.keyword_input.setPlaceholderText("多关键字空格分隔，需同时匹配 如：软件测试 Python")
         self.keyword_input.setMinimumWidth(FIELD_MIN_W)
         self.keyword_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         param_grid.addWidget(self.keyword_input, row, 1)
@@ -4242,6 +4277,7 @@ def main():
     """应用入口"""
     import os
     os.environ['QT_AUTO_SCREEN_SCALE_FACTOR'] = '1'
+    setup_file_logging()  # 运行日志写入脚本目录
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
 

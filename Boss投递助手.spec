@@ -6,7 +6,11 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('boss_delivery_v2.py', '.')],
-    hiddenimports=['PyQt5.sip', 'DrissionPage', 'browser_cookie3', 'pymysql', 'Crypto', 'win32crypt', 'win32.win32crypt', 'openai', 'PyPDF2', 'requests', 'cryptography'],
+    hiddenimports=[
+        'PyQt5.sip', 'DrissionPage', 'browser_cookie3', 'pymysql',
+        'Crypto', 'win32crypt', 'win32.win32crypt', 'openai', 'PyPDF2',
+        'requests', 'cryptography', 'websocket', 'websocket-client',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
