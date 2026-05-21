@@ -1562,10 +1562,114 @@ class BrowserAuthHelper:
             for c in cdp_cookies:
                 cookies[c['name']] = c['value']
 
-            has_valid = (platform == 'boss' and any('zp_stoken' in k.lower() for k in cookies)) or \
+            has_zp_stoken = any('zp_stoken' in k.lower() for k in cookies)
+            has_wt2 = any('wt2' == k for k in cookies)
+            has_wbg = any('wbg' == k for k in cookies)
+
+            has_valid = (platform == 'boss' and has_zp_stoken) or \
                         (platform == 'zhilian' and len(cookies) >= 2)
+
+            if has_valid and platform == 'boss' and (not has_wt2 or not has_wbg):
+                # zp_stoken存在但wt2/wbg缺失 → 用户未真正登录，需等待登录
+                if not chrome_running:
+                    # Chrome是我们启动的，保持打开并轮询等待用户登录
+                    self._log(f"CDP: zp_stoken存在但wt2={'OK' if has_wt2 else 'NO'}/wbg={'OK' if has_wbg else 'NO'}，等待用户登录...")
+                    self._log(f"CDP: 请在Chrome窗口中登录BOSS直聘，程序将持续检测...")
+                    for attempt in range(1, 25):  # 最多轮询24次 = 2分钟
+                        time.sleep(5)
+                        self._log(f"CDP: 第{attempt}次检测登录状态...")
+                        try:
+                            import requests as _req2
+                            resp2 = _req2.get(f'http://127.0.0.1:{debug_port}/json', timeout=5)
+                            tabs2 = resp2.json()
+                            ws_url2 = None
+                            for t in tabs2:
+                                if main_domain in t.get('url', ''):
+                                    ws_url2 = t.get('webSocketDebuggerUrl', '')
+                                    break
+                            if not ws_url2 and tabs2:
+                                ws_url2 = tabs2[0].get('webSocketDebuggerUrl', '')
+                            if not ws_url2:
+                                continue
+
+                            # 导航到搜索页让JS生成最新token
+                            nav_ws2 = websocket.create_connection(ws_url2, timeout=10)
+                            nav_cmd2 = _json.dumps({"id": 1, "method": "Page.navigate", "params": {"url": search_url}})
+                            nav_ws2.send(nav_cmd2)
+                            nav_resp2 = ""
+                            while True:
+                                chunk2 = nav_ws2.recv()
+                                nav_resp2 += chunk2
+                                try:
+                                    msg2 = _json.loads(chunk2)
+                                    if msg2.get('id') == 1:
+                                        break
+                                except Exception:
+                                    if len(nav_resp2) > 100000:
+                                        break
+                            nav_ws2.close()
+                            time.sleep(5)
+
+                            # 重新提取cookie
+                            resp3 = _req2.get(f'http://127.0.0.1:{debug_port}/json', timeout=5)
+                            tabs3 = resp3.json()
+                            ws_url3 = None
+                            for t in tabs3:
+                                if main_domain in t.get('url', ''):
+                                    ws_url3 = t.get('webSocketDebuggerUrl', '')
+                                    break
+                            if not ws_url3 and tabs3:
+                                ws_url3 = tabs3[0].get('webSocketDebuggerUrl', '')
+                            if not ws_url3:
+                                continue
+
+                            ws2 = websocket.create_connection(ws_url3, timeout=10)
+                            cmd2 = _json.dumps({"id": 1, "method": "Network.getCookies", "params": {"urls": [f"https://www.{main_domain}"]}})
+                            ws2.send(cmd2)
+                            resp_data2 = ""
+                            while True:
+                                chunk2 = ws2.recv()
+                                resp_data2 += chunk2
+                                try:
+                                    msg2 = _json.loads(chunk2)
+                                    if msg2.get('id') == 1:
+                                        break
+                                except Exception:
+                                    if len(resp_data2) > 100000:
+                                        break
+                            ws2.close()
+
+                            resp_json2 = _json.loads(resp_data2)
+                            result2 = resp_json2.get('result', {})
+                            cdp_cookies2 = result2.get('cookies', [])
+                            cookies2 = {}
+                            for c in cdp_cookies2:
+                                cookies2[c['name']] = c['value']
+
+                            has_wt2_2 = any('wt2' == k for k in cookies2)
+                            has_wbg_2 = any('wbg' == k for k in cookies2)
+                            self._log(f"CDP: 第{attempt}次检测 wt2={'OK' if has_wt2_2 else 'NO'} wbg={'OK' if has_wbg_2 else 'NO'}")
+
+                            if has_wt2_2 and has_wbg_2:
+                                self._log(f"CDP: 登录检测成功！提取到 {len(cookies2)} 个Cookie")
+                                return cookies2
+                        except Exception as poll_err:
+                            self._log(f"CDP: 第{attempt}次检测失败: {poll_err}")
+
+                    # 超时
+                    self._log("CDP: 等待登录超时(2分钟)，请确保在Chrome中已登录BOSS直聘后重试")
+                    try:
+                        chrome_process.terminate()
+                    except Exception:
+                        pass
+                    return None
+                else:
+                    # Chrome已在运行，但缺少wt2/wbg，提示用户
+                    self._log(f"CDP: 提取到Cookie但wt2={'OK' if has_wt2 else 'NO'}/wbg={'OK' if has_wbg else 'NO'}，请在Chrome中刷新BOSS直聘页面后重试")
+                    return None
+
             if has_valid:
-                self._log(f"CDP: 成功提取 {len(cookies)} 个实时Cookie ({platform})")
+                self._log(f"CDP: 成功提取 {len(cookies)} 个实时Cookie (wt2={'OK' if has_wt2 else 'NO'} wbg={'OK' if has_wbg else 'NO'})")
                 return cookies
             else:
                 self._log(f"CDP: 提取到 {len(cookies)} 个Cookie但验证未通过 ({platform})")
@@ -4330,7 +4434,7 @@ class AutoDeliveryTab(QWidget):
                 co.set_argument('--disable-dev-shm-usage')
                 co.set_argument('--disable-gpu')
                 co.set_argument('--remote-allow-origins=*')
-                co.set_argument('--window-position=-32000,-32000')  # 窗口移到屏幕外，后台运行
+                co.set_argument('--window-position=100,100')  # 窗口在可见位置，方便用户观察/操作
                 co.set_argument('--window-size=1280,800')
                 page = ChromiumPage(co)
                 browser_deliverer = BossBrowserDeliverer(page, self.analyzer,
