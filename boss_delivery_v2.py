@@ -3615,18 +3615,22 @@ class AutoDeliverWorker(QThread):
                     job_info['job_detail'] = job_detail
                     job_info['hr_name'] = hr_name
 
-                    # AI匹配度
-                    match_score = 50
+                    # AI匹配度（与API模式保持一致）
                     if has_resume and job_detail:
                         try:
                             result = self.analyzer.calculate_match_score(
                                 resume_text=self.analyzer.resume_text,
                                 job_title=title, job_detail=job_detail,
                                 company_name=company)
-                            match_score = result.get("score", 50)
-                        except Exception:
-                            pass
-                    job_info['match_score'] = match_score
+                            job_info["match_score"] = result.get("score", 50)
+                            job_info["_match_detail"] = result
+                        except Exception as e:
+                            self.log_signal.emit(_log_fmt("投递", f"AI匹配度计算失败: {e}"))
+                            job_info["match_score"] = 50
+                    else:
+                        job_info["match_score"] = 50
+
+                    match_score = job_info["match_score"]
 
                     # 保存到数据库
                     job_url_safe = job_url[:500]
