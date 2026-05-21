@@ -745,12 +745,38 @@ class JobDatabase:
         conn.close()
         return rows
 
+    def exists(self, job_url: str) -> bool:
+        """检查岗位URL是否已在数据库中（任意状态）"""
+        import sqlite3
+        conn = sqlite3.connect(self._get_path())
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM delivered_jobs WHERE job_url=?", (job_url,))
+        result = cur.fetchone()
+        conn.close()
+        return result is not None
+
+    def get_status(self, job_url: str) -> int:
+        """获取岗位状态，不存在返回-1"""
+        import sqlite3
+        conn = sqlite3.connect(self._get_path())
+        cur = conn.cursor()
+        cur.execute("SELECT status FROM delivered_jobs WHERE job_url=?", (job_url,))
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else -1
+
     def filter_new_jobs(self, jobs: Dict) -> Dict:
-        """过滤已投递/已跳过的岗位，返回新岗位字典"""
+        """过滤已投递/处理中的岗位，跳过低分/失败的可重新评估
+        状态说明: 0=待投递 1=已投递(严禁重投) 2=失败 3=无详情 4=低分跳过
+        仅过滤状态0和1，状态2/3/4允许重新进入投递流程"""
         new_jobs = {}
         for url, job in jobs.items():
-            if not self.is_delivered(url) and not self.is_skipped(url):
-                new_jobs[url] = job
+            status = self.get_status(url)
+            if status < 0:
+                new_jobs[url] = job  # 全新岗位
+            elif status >= 2:
+                new_jobs[url] = job  # 失败/无详情/低分 → 允许重新评估
+            # status 0/1 → 过滤掉（待投递中 / 已投递成功）
         return new_jobs
 
     def get_daily_stats(self, date: str = None) -> dict:
@@ -1510,6 +1536,12 @@ class BOSSApiClient:
         self.session: Optional[object] = None
         self._cookie_refresh_count = 0
         self._consecutive_37_count = 0
+        self._api_lock = threading.RLock()     # 序列化所有API调用
+        self._last_api_call = 0                # 上次API调用时间戳
+        self._min_api_interval = 10            # 最小API调用间隔（秒）
+        self._last_delivery_time = 0           # 上次投递时间戳
+        self._min_delivery_interval = 30       # 投递最小间隔（秒），投递端点更敏感
+        self.daily_limit_reached = False       # 是否触发每日120次沟通上限
 
         if self.use_real_api:
             self.session = requests.Session()
@@ -1527,7 +1559,7 @@ class BOSSApiClient:
         self._cookie_refresh_count += 1
         self._log(f"尝试从浏览器刷新Cookie (第{self._cookie_refresh_count}次)...")
         try:
-            auth = BrowserAuthHelper()
+            auth = BrowserAuthHelper(log_callback=self.log_callback)
             cookies = auth.extract_cookies()
             if cookies and self.set_cookies(cookies):
                 self._cookie_refresh_count = 0
@@ -1642,106 +1674,152 @@ class BOSSApiClient:
     # ---- 通用请求方法 ----
 
     def _api_get(self, path: str, params: dict = None, action: str = "API请求",
-                 retry_on_expire: bool = True) -> Optional[Dict]:
-        """通用GET请求"""
+                 retry_on_expire: bool = True, _fast_retry: int = 0) -> Optional[Dict]:
+        """通用GET请求（线程安全，自动限速，最多3次"操作太快"重试）"""
         if not self.use_real_api or not self.session:
-            return None
-        url = f"{self.BASE_URL}{path}"
-        try:
-            resp = self.session.get(url, params=params, timeout=15)
-            content_type = resp.headers.get("Content-Type", "")
-            if "text/html" in content_type:
-                self._log(f"[{action}] 登录已过期，正尝试自动刷新...")
-                if retry_on_expire and self.refresh_cookies_from_browser():
-                    time.sleep(2)
-                    return self._api_get(path, params, action, retry_on_expire=False)
-                return None
-            data = resp.json()
-            code = data.get("code", -1)
-            msg = data.get("message", "")
-            if code == 0:
-                self._consecutive_37_count = 0
-                return data.get("zpData", data)
-            elif code == 37:
-                self._consecutive_37_count += 1
-                self._log(f"[{action}] 需要重新验证(第{self._consecutive_37_count}次)")
-                if self._consecutive_37_count >= 3 or retry_on_expire:
-                    self._log(f"[{action}] 正在自动刷新验证信息...")
-                    if self.refresh_cookies_from_browser():
-                        self._consecutive_37_count = 0
-                        time.sleep(2)
-                        return self._api_get(path, params, action, retry_on_expire=False)
-                return None
-            elif code in (1, 9):
-                self._log(f"[{action}] 操作太快，等待8秒后重试...")
-                time.sleep(8)
-                if retry_on_expire:
-                    return self._api_get(path, params, action, retry_on_expire=False)
-                return None
-            elif code in (17, 19):
-                self._log(f"[{action}] 参数有误: {msg}")
-                return None
-            elif code in (121, 122):
-                self._log(f"[{action}] 安全验证未通过，请刷新登录")
-                return None
-            else:
-                if msg:
-                    self._log(f"[{action}] 失败({code}): {msg}")
-                return None
-        except requests.exceptions.Timeout:
-            self._log(f"[{action}] 请求超时，请检查网络")
-            return None
-        except requests.exceptions.ConnectionError:
-            self._log(f"[{action}] 网络连接失败，请检查网络")
-            return None
-        except Exception as e:
-            self._log(f"[{action}] 网络异常: {e}")
             return None
 
+        with self._api_lock:
+            # 冷却等待：确保两次API调用间隔≥10秒
+            elapsed = time.time() - self._last_api_call
+            if elapsed < self._min_api_interval:
+                wait = self._min_api_interval - elapsed + random.uniform(0, 2)
+                if wait > 0.5:
+                    self._log(f"[{action}] API冷却 {wait:.1f}秒...")
+                time.sleep(wait)
+            self._last_api_call = time.time()
+
+            url = f"{self.BASE_URL}{path}"
+            try:
+                resp = self.session.get(url, params=params, timeout=15)
+                content_type = resp.headers.get("Content-Type", "")
+                if "text/html" in content_type:
+                    self._log(f"[{action}] 登录已过期，正尝试自动刷新...")
+                    if retry_on_expire and self.refresh_cookies_from_browser():
+                        time.sleep(2)
+                        return self._api_get(path, params, action, retry_on_expire=False)
+                    return None
+                data = resp.json()
+                code = data.get("code", -1)
+                msg = data.get("message", "")
+                if code == 0:
+                    self._consecutive_37_count = 0
+                    return data.get("zpData", data)
+                elif code == 37:
+                    self._consecutive_37_count += 1
+                    self._log(f"[{action}] 需要重新验证(第{self._consecutive_37_count}次)")
+                    if self._consecutive_37_count >= 3 or retry_on_expire:
+                        self._log(f"[{action}] 正在自动刷新验证信息...")
+                        if self.refresh_cookies_from_browser():
+                            self._consecutive_37_count = 0
+                            time.sleep(2)
+                            return self._api_get(path, params, action, retry_on_expire=False)
+                    return None
+                elif code in (1, 9):
+                    # "开聊提醒" = 每日120次沟通上限，必须手动在APP触发，重试无效
+                    if "开聊" in str(msg):
+                        self._log(f"[{action}] 触发每日沟通上限(120次): code={code} msg={msg}")
+                        self._log(f"[{action}] 完整响应: {json.dumps(data, ensure_ascii=False)}")
+                        self.daily_limit_reached = True
+                        return None
+                    if _fast_retry < 2:  # 最多重试3次(0,1,2)，等待递增
+                        wait = 8 * (_fast_retry + 1)
+                        self._log(f"[{action}] 操作太快(code={code} {msg}), {wait}秒后重试({_fast_retry+1}/3)...")
+                        time.sleep(wait)
+                        return self._api_get(path, params, action, retry_on_expire,
+                                            _fast_retry=_fast_retry + 1)
+                    self._log(f"[{action}] 操作太快(code={code} {msg})，已达最大重试次数")
+                    return None
+                elif code in (17, 19):
+                    self._log(f"[{action}] 参数有误: {msg}")
+                    return None
+                elif code in (121, 122):
+                    self._log(f"[{action}] 安全验证未通过，请刷新登录")
+                    return None
+                else:
+                    if msg:
+                        self._log(f"[{action}] 失败({code}): {msg}")
+                    return None
+            except requests.exceptions.Timeout:
+                self._log(f"[{action}] 请求超时，请检查网络")
+                return None
+            except requests.exceptions.ConnectionError:
+                self._log(f"[{action}] 网络连接失败，请检查网络")
+                return None
+            except Exception as e:
+                self._log(f"[{action}] 网络异常: {e}")
+                return None
+
     def _api_post(self, path: str, json_data: dict = None, action: str = "API请求",
-                  retry_on_expire: bool = True) -> Optional[Dict]:
-        """通用POST请求"""
+                  retry_on_expire: bool = True, _fast_retry: int = 0) -> Optional[Dict]:
+        """通用POST请求（线程安全，自动限速，最多3次"操作太快"重试）"""
         if not self.use_real_api or not self.session:
             return None
-        url = f"{self.BASE_URL}{path}"
-        try:
-            resp = self.session.post(url, json=json_data, timeout=15)
-            content_type = resp.headers.get("Content-Type", "")
-            if "text/html" in content_type:
-                self._log(f"[{action}] 登录已过期，正尝试自动刷新...")
-                if retry_on_expire and self.refresh_cookies_from_browser():
-                    time.sleep(2)
-                    return self._api_post(path, json_data, action, retry_on_expire=False)
-                return None
-            data = resp.json()
-            code = data.get("code", -1)
-            msg = data.get("message", "")
-            if code == 0:
-                self._consecutive_37_count = 0
-                return data.get("zpData", data)
-            elif code == 37:
-                self._consecutive_37_count += 1
-                self._log(f"[{action}] 需要重新验证(第{self._consecutive_37_count}次)")
-                if self._consecutive_37_count >= 3 or retry_on_expire:
-                    self._log(f"[{action}] 正在自动刷新验证信息...")
-                    if self.refresh_cookies_from_browser():
-                        self._consecutive_37_count = 0
+
+        with self._api_lock:
+            # 冷却等待：确保两次API调用间隔≥10秒
+            elapsed = time.time() - self._last_api_call
+            if elapsed < self._min_api_interval:
+                wait = self._min_api_interval - elapsed + random.uniform(0, 2)
+                if wait > 0.5:
+                    self._log(f"[{action}] API冷却 {wait:.1f}秒...")
+                time.sleep(wait)
+            self._last_api_call = time.time()
+
+            url = f"{self.BASE_URL}{path}"
+            try:
+                resp = self.session.post(url, json=json_data, timeout=15)
+                content_type = resp.headers.get("Content-Type", "")
+                if "text/html" in content_type:
+                    self._log(f"[{action}] 登录已过期，正尝试自动刷新...")
+                    if retry_on_expire and self.refresh_cookies_from_browser():
                         time.sleep(2)
                         return self._api_post(path, json_data, action, retry_on_expire=False)
+                    return None
+                data = resp.json()
+                code = data.get("code", -1)
+                msg = data.get("message", "")
+                if code == 0:
+                    self._consecutive_37_count = 0
+                    return data.get("zpData", data)
+                elif code == 37:
+                    self._consecutive_37_count += 1
+                    self._log(f"[{action}] 需要重新验证(第{self._consecutive_37_count}次)")
+                    if self._consecutive_37_count >= 3 or retry_on_expire:
+                        self._log(f"[{action}] 正在自动刷新验证信息...")
+                        if self.refresh_cookies_from_browser():
+                            self._consecutive_37_count = 0
+                            time.sleep(2)
+                            return self._api_post(path, json_data, action, retry_on_expire=False)
+                    return None
+                elif code in (1, 9):
+                    # "开聊提醒" = 每日120次沟通上限，必须手动在APP触发，重试无效
+                    if "开聊" in str(msg):
+                        self._log(f"[{action}] 触发每日沟通上限(120次): code={code} msg={msg}")
+                        self._log(f"[{action}] 完整响应: {json.dumps(data, ensure_ascii=False)}")
+                        self.daily_limit_reached = True
+                        return None
+                    if _fast_retry < 2:  # 最多重试3次(0,1,2)，等待递增
+                        wait = 8 * (_fast_retry + 1)
+                        self._log(f"[{action}] 操作太快(code={code} {msg}), {wait}秒后重试({_fast_retry+1}/3)...")
+                        time.sleep(wait)
+                        return self._api_post(path, json_data, action, retry_on_expire,
+                                             _fast_retry=_fast_retry + 1)
+                    self._log(f"[{action}] 操作太快(code={code} {msg})，已达最大重试次数")
+                    return None
+                else:
+                    if msg:
+                        self._log(f"[{action}] 失败({code}): {msg}")
+                    return None
+            except requests.exceptions.Timeout:
+                self._log(f"[{action}] 请求超时，请检查网络")
                 return None
-            elif code in (1, 9):
-                self._log(f"[{action}] 操作太快，等待8秒后重试...")
-                time.sleep(8)
-                if retry_on_expire:
-                    return self._api_post(path, json_data, action, retry_on_expire=False)
+            except requests.exceptions.ConnectionError:
+                self._log(f"[{action}] 网络连接失败，请检查网络")
                 return None
-            else:
-                if msg:
-                    self._log(f"[{action}] 失败({code}): {msg}")
+            except Exception as e:
+                self._log(f"[{action}] 网络异常: {e}")
                 return None
-        except Exception as e:
-            self._log(f"[{action}] 网络异常: {e}")
-            return None
 
     # ---- 真实API：搜索岗位 ----
 
@@ -1812,6 +1890,14 @@ class BOSSApiClient:
         if not security_id:
             self._log("缺少 securityId，无法投递")
             return None
+
+        # 投递端点比搜索更敏感，强制30秒最小间隔
+        elapsed = time.time() - self._last_delivery_time
+        if elapsed < self._min_delivery_interval:
+            wait = self._min_delivery_interval - elapsed + random.uniform(0, 3)
+            self._log(f"投递冷却 {wait:.1f}秒（上次投递距今仅{elapsed:.0f}秒）...")
+            time.sleep(wait)
+
         params = {"securityId": security_id}
         if lid:
             params["lid"] = lid
@@ -1822,6 +1908,7 @@ class BOSSApiClient:
             self.session.headers["Referer"] = f"{self.BASE_URL}/web/geek/chat"
 
         result = self._api_get(self.ADD_FRIEND_URL, params=params, action="打招呼/投递")
+        self._last_delivery_time = time.time()
 
         if self.session:
             self.session.headers["Referer"] = f"{self.BASE_URL}/web/geek/job"
@@ -2062,7 +2149,7 @@ class ResumeAnalyzer:
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.7,
-                max_tokens=2048,
+                max_tokens=4096,
             )
 
             elapsed = time.time() - t0
@@ -2131,16 +2218,19 @@ score为综合匹配度0-100整数。reasons为匹配点列表。concerns为不�
             response = self.client.chat.completions.create(
                 model=DEEPSEEK_MODEL,
                 messages=[
-                    {"role": "system", "content": f"你是专业HR，擅长公正评估简历与岗位匹配度。每次评估独立进行，不受历史评估影响。评分时注意：只要方向对口就有基础分50-65，不要过于严苛，大多数真实投递场景的分数集中在55-80分之间。本次评估ID: {request_id}"},
+                    {"role": "system", "content": f"你是专业HR，擅长公正、严格、差异化地评估简历与岗位匹配度。每次评估完全独立，必须根据岗位实际要求与候选人背景的对比给出不同分数，严禁给出千篇一律的分数。评分范围0-100，真正匹配的给高分，不匹配的给低分，不要锚定在某个区间。本次评估ID: {request_id}"},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.5,
-                max_tokens=1024,
+                temperature=0.7,
+                max_tokens=4096,
             )
 
             elapsed = time.time() - t0
             result = response.choices[0].message.content
-            self._log(f"匹配度响应成功 (耗时 {elapsed:.1f}s): {result}")
+            finish_reason = response.choices[0].finish_reason
+            if finish_reason == "length":
+                self._log(f"匹配度响应被截断(finish_reason=length)，可能评分不准，原始: {result[:200]}...")
+            self._log(f"匹配度响应成功 (耗时 {elapsed:.1f}s, finish={finish_reason}): {result}")
 
             try:
                 json_start = result.find('{')
@@ -2412,6 +2502,25 @@ class BossBrowserDeliverer:
                     all_as = current_page.eles('tag:a', timeout=3)
                     self.log(f"页面a元素总数: {len(all_as)}")
 
+                    # 诊断：打印前15个含job_detail的链接详情
+                    debug_count = 0
+                    for idx, a in enumerate(all_as):
+                        try:
+                            href = a.attr('href') or ''
+                            if 'job_detail' in href:
+                                if debug_count < 15:
+                                    raw_text = a.text
+                                    # 尝试通过js获取innerText
+                                    try:
+                                        js_text = a.run_js('return this.innerText || "";')
+                                    except Exception:
+                                        js_text = ""
+                                    self.log(f"  [调试{debug_count+1}] idx={idx}, href={href[:120]}")
+                                    self.log(f"           a.text={repr(raw_text)}, innerText={repr(js_text[:80])}")
+                                    debug_count += 1
+                        except Exception:
+                            continue
+
                     filtered_links = []
                     seen_urls = set()
 
@@ -2427,12 +2536,23 @@ class BossBrowserDeliverer:
                                     continue
                                 seen_urls.add(job_url)
 
-                                title = a.text.strip() if a.text else "未知"
+                                # 尝试多种方式提取文本
+                                title = ""
+                                try:
+                                    title = a.run_js('return this.innerText || "";').strip()
+                                except Exception:
+                                    pass
+                                if not title:
+                                    title = (a.text or "").strip()
 
-                                if title and title not in ["查看更多信息", "职位搜索", "", "未知"]:
-                                    if job_url and "job_detail" in job_url and len(job_url) > 50:
-                                        self.log(f"  岗位链接 {idx + 1}: {job_url} - {title}")
-                                        filtered_links.append(a)
+                                # 跳过明显的非岗位链接
+                                skip_titles = ["查看更多信息", "职位搜索", "", "未知"]
+                                if title in skip_titles:
+                                    continue
+
+                                if job_url and "job_detail" in job_url:
+                                    self.log(f"  岗位链接 {len(filtered_links) + 1}: {title[:30]} - {job_url[:100]}")
+                                    filtered_links.append(a)
                         except Exception:
                             continue
 
@@ -2461,15 +2581,20 @@ class BossBrowserDeliverer:
                                 job_url = href
                                 if not job_url.startswith('http'):
                                     job_url = f"https://www.zhipin.com{job_url}"
-                                title = link.text.strip() if link.text else "未知"
+                                title = "未知"
+                                try:
+                                    title = link.run_js('return this.innerText || "";').strip()
+                                except Exception:
+                                    pass
+                                if not title:
+                                    title = (link.text or "").strip() or "未知"
                                 break
 
                         if job_url and job_url not in seen_urls:
                             seen_urls.add(job_url)
                             if title and title not in ["查看更多信息", "职位搜索", "", "未知"]:
-                                if len(job_url) > 50:
-                                    self.log(f"  岗位卡片 {idx + 1}: {job_url} - {title}")
-                                    filtered_cards.append(card)
+                                self.log(f"  岗位卡片 {idx + 1}: {job_url} - {title}")
+                                filtered_cards.append(card)
                     except Exception:
                         continue
 
@@ -2521,7 +2646,14 @@ class BossBrowserDeliverer:
                 job_url = job_link.attr('href')
                 if job_url and not job_url.startswith('http'):
                     job_url = f"https://www.zhipin.com{job_url}"
-                title = job_link.text.strip() if job_link.text else "未知"
+                # 优先用innerText提取嵌套元素文本
+                title = "未知"
+                try:
+                    title = job_link.run_js('return this.innerText || "";').strip()
+                except Exception:
+                    pass
+                if not title:
+                    title = (job_link.text or "").strip() or "未知"
 
             # 提取公司名称
             try:
@@ -3177,98 +3309,6 @@ class ResumeTab(QWidget):
             self.analyze_btn.setEnabled(True)
 
 
-class RecordTab(QWidget):
-    """投递记录页签"""
-
-    def __init__(self, db: JobDatabase, parent=None):
-        super().__init__(parent)
-        self.db = db
-        self._init_ui()
-        self._load_records()
-
-    def _init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-
-        # 统计区
-        stats_group = QGroupBox("投递统计")
-        stats_layout = QFormLayout(stats_group)
-        self.today_api_label = QLabel("API模式今日：0")
-        self.today_browser_label = QLabel("浏览器模式今日：0")
-        self.today_total_label = QLabel("今日合计：0")
-        stats_row = QHBoxLayout()
-        stats_row.addWidget(self.today_api_label)
-        stats_row.addWidget(self.today_browser_label)
-        stats_row.addWidget(self.today_total_label)
-        stats_row.addStretch()
-        stats_layout.addRow("今日：", stats_row)
-        layout.addWidget(stats_group)
-
-        # 刷新按钮
-        btn_row = QHBoxLayout()
-        self.refresh_btn = QPushButton("刷新记录")
-        self.refresh_btn.clicked.connect(self._load_records)
-        self.refresh_btn.setStyleSheet("background-color: #4a6cf7; color: white; border: none; border-radius: 4px; padding: 8px 20px;")
-        btn_row.addWidget(self.refresh_btn)
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
-
-        # 记录表格
-        self.record_table = QTableWidget()
-        self.record_table.setColumnCount(8)
-        self.record_table.setHorizontalHeaderLabels([
-            "岗位名称", "公司", "匹配度", "投递模式", "投递时间", "状态", "活跃时间", "招呼语"
-        ])
-        self.record_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.record_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.record_table.setAlternatingRowColors(True)
-        header = self.record_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.Interactive)
-        header.setSectionResizeMode(6, QHeaderView.Fixed)
-        header.setSectionResizeMode(7, QHeaderView.Fixed)
-        self.record_table.setColumnWidth(1, 80)
-        self.record_table.setColumnWidth(6, 70)
-        self.record_table.setColumnWidth(7, 120)
-        self.record_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.record_table.setMinimumHeight(200)
-        layout.addWidget(self.record_table, stretch=1)
-
-    def _load_records(self):
-        records = self.db.get_delivery_records(limit=200)
-        self.record_table.setRowCount(len(records))
-        status_map = {0: "待投递", 1: "已投递", 2: "已跳过", 3: "失败", 4: "匹配不足", 5: "时间不符"}
-        for i, r in enumerate(records):
-            self.record_table.setItem(i, 0, QTableWidgetItem(r.get('title', '')))
-            self.record_table.setItem(i, 1, QTableWidgetItem(r.get('company', '')))
-            score_item = QTableWidgetItem(str(r.get('match_score', 0)))
-            self.record_table.setItem(i, 2, score_item)
-            mode = r.get('delivery_mode', 'api')
-            self.record_table.setItem(i, 3, QTableWidgetItem("API" if mode == "api" else "浏览器"))
-            self.record_table.setItem(i, 4, QTableWidgetItem(r.get('updated_at', '')[:16]))
-            status_text = status_map.get(r.get('status', 0), "未知")
-            status_item = QTableWidgetItem(status_text)
-            if r.get('status') == 1:
-                status_item.setForeground(QColor("#10b981"))
-            elif r.get('status') in (2, 3):
-                status_item.setForeground(QColor("#ef4444"))
-            self.record_table.setItem(i, 5, status_item)
-            at_val = r.get('active_time', 0)
-            if at_val > 0:
-                at_str = datetime.fromtimestamp(at_val / 1000.0).strftime("%Y-%m-%d")
-            else:
-                at_str = ''
-            self.record_table.setItem(i, 6, QTableWidgetItem(at_str))
-            greeting = r.get('greeting', '')
-            self.record_table.setItem(i, 7, QTableWidgetItem(greeting[:40] if greeting else ''))
-
-        # 更新统计
-        stats = self.db.get_daily_stats()
-        self.today_api_label.setText(f"API模式今日：{stats.get('api', 0)}")
-        self.today_browser_label.setText(f"浏览器模式今日：{stats.get('browser', 0)}")
-        self.today_total_label.setText(f"今日合计：{stats.get('total', 0)}")
-
-
 # ==================== 自动投递 Worker（双模式） ====================
 
 class AutoDeliverWorker(QThread):
@@ -3279,6 +3319,7 @@ class AutoDeliverWorker(QThread):
     job_enriched = pyqtSignal(str, dict)
     all_done = pyqtSignal(int, int)
     log_signal = pyqtSignal(str)
+    daily_limit_reached = pyqtSignal()
 
     def __init__(self, api_client: BOSSApiClient, db: JobDatabase,
                  analyzer: ResumeAnalyzer, keyword: str, location: str,
@@ -3357,7 +3398,7 @@ class AutoDeliverWorker(QThread):
                     pass
 
             with api_lock:
-                if self._stop_flag:
+                if self._stop_flag or self.api_client.daily_limit_reached:
                     return url, False
                 success = self.api_client.deliver_job(url, greeting, job_data=job)
 
@@ -3501,6 +3542,12 @@ class AutoDeliverWorker(QThread):
                 for future in as_completed(futures):
                     if self._stop_flag or delivered_count >= self.target_count:
                         break
+                    if self.api_client.daily_limit_reached:
+                        self.log_signal.emit(_log_fmt("投递",
+                            "达到每日120次沟通上限，请先在BOSS直聘APP中手动点击'开聊'，再继续投递"))
+                        self.daily_limit_reached.emit()
+                        self._stop_flag = True
+                        break
 
         finally:
             executor.shutdown(wait=False)
@@ -3638,17 +3685,183 @@ class AutoDeliverWorker(QThread):
         self.all_done.emit(delivered_count, failed_count)
 
 
+# ==================== 岗位列表页签 ====================
+
+class JobListTab(QWidget):
+    """岗位列表独立页签 — 展示本次搜索到的岗位及投递状态"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._job_row_map: Dict[str, int] = {}
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        # 岗位列表（11列）
+        self.job_table = QTableWidget()
+        self.job_table.setColumnCount(11)
+        self.job_table.setHorizontalHeaderLabels([
+            "岗位名称", "公司", "地区", "薪资", "活跃时间", "活跃描述",
+            "匹配度", "原因", "岗位详情", "投递模式", "状态"
+        ])
+        self.job_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.job_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.job_table.setAlternatingRowColors(True)
+        header = self.job_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.Fixed)
+        header.setSectionResizeMode(4, QHeaderView.Fixed)
+        header.setSectionResizeMode(5, QHeaderView.Fixed)
+        header.setSectionResizeMode(6, QHeaderView.Fixed)
+        header.setSectionResizeMode(7, QHeaderView.Fixed)
+        header.setSectionResizeMode(8, QHeaderView.Stretch)
+        header.setSectionResizeMode(9, QHeaderView.Fixed)
+        header.setSectionResizeMode(10, QHeaderView.Fixed)
+        header.setStretchLastSection(False)
+        self.job_table.setColumnWidth(1, 80)
+        self.job_table.setColumnWidth(2, 50)
+        self.job_table.setColumnWidth(3, 65)
+        self.job_table.setColumnWidth(4, 65)
+        self.job_table.setColumnWidth(5, 55)
+        self.job_table.setColumnWidth(6, 48)
+        self.job_table.setColumnWidth(7, 70)
+        self.job_table.setColumnWidth(9, 50)
+        self.job_table.setColumnWidth(10, 50)
+        self.job_table.setMinimumHeight(180)
+        self.job_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.job_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self.job_table)
+
+    def clear(self):
+        """清空岗位列表"""
+        self.job_table.setRowCount(0)
+        self._job_row_map.clear()
+
+    def add_job(self, url: str, job: dict):
+        """添加新岗位到列表"""
+        row = self.job_table.rowCount()
+        self.job_table.insertRow(row)
+        self._fill_row(row, url, job)
+
+    def update_job(self, url: str, job: dict):
+        """更新已有岗位信息（如匹配度、详情等）"""
+        if url in self._job_row_map:
+            row = self._job_row_map[url]
+        else:
+            row = self.job_table.rowCount()
+            self.job_table.insertRow(row)
+        self._fill_row(row, url, job)
+
+    def update_result(self, url: str, success: bool):
+        """更新投递结果状态"""
+        if url in self._job_row_map:
+            row = self._job_row_map[url]
+            status_text = "已投递" if success else "投递失败"
+            status_item = QTableWidgetItem(status_text)
+            status_item.setForeground(QColor("#27ae60" if success else "#e74c3c"))
+            self.job_table.setItem(row, 10, status_item)
+
+    def _fill_row(self, row: int, url: str, job: dict):
+        self._job_row_map[url] = row
+
+        title = job.get('title', '')
+        title_item = QTableWidgetItem(title)
+        title_item.setToolTip(title)
+        self.job_table.setItem(row, 0, title_item)
+
+        company = job.get('company', '未知')
+        company_item = QTableWidgetItem(company)
+        company_item.setToolTip(f"{company}\n{job.get('company_scale', '')} | {job.get('company_stage', '')} | {job.get('company_industry', '')}")
+        self.job_table.setItem(row, 1, company_item)
+
+        location = job.get('location', job.get('city', ''))
+        district = job.get('district', '')
+        loc_text = f"{location} {district}".strip() if district else location
+        loc_item = QTableWidgetItem(loc_text)
+        loc_item.setToolTip(loc_text)
+        self.job_table.setItem(row, 2, loc_item)
+
+        salary_item = QTableWidgetItem(job.get('salary', ''))
+        salary_item.setToolTip(job.get('salary', ''))
+        self.job_table.setItem(row, 3, salary_item)
+
+        active_time = job.get('active_time', 0)
+        if active_time > 0:
+            active_dt = datetime.fromtimestamp(active_time / 1000.0)
+            active_date_str = active_dt.strftime("%Y-%m-%d")
+            active_tip = active_dt.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            active_date_str = ''
+            active_tip = ''
+        at_item = QTableWidgetItem(active_date_str)
+        at_item.setToolTip(active_tip)
+        self.job_table.setItem(row, 4, at_item)
+
+        active_desc = job.get('active_time_desc', '')
+        ad_item = QTableWidgetItem(active_desc)
+        ad_item.setToolTip(active_desc)
+        self.job_table.setItem(row, 5, ad_item)
+
+        score_val = job.get('match_score', 0)
+        score_item = QTableWidgetItem(str(score_val))
+        if score_val >= 80:
+            score_item.setForeground(QColor("#27ae60"))
+        elif score_val >= 60:
+            score_item.setForeground(QColor("#f39c12"))
+        else:
+            score_item.setForeground(QColor("#e74c3c"))
+        self.job_table.setItem(row, 6, score_item)
+
+        match_detail = job.get('_match_detail', {}) or {}
+        reasons = match_detail.get('reasons', [])
+        reason_text = reasons[0] if reasons else '-'
+        reason_item = QTableWidgetItem(reason_text)
+        tip_lines = [f"综合匹配度: {score_val}分"]
+        if reasons:
+            for r in reasons:
+                tip_lines.append(f"  + {r}")
+        reason_item.setToolTip('\n'.join(tip_lines))
+        self.job_table.setItem(row, 7, reason_item)
+
+        detail = job.get('job_detail', '')
+        detail_short = detail[:60].replace('\n', ' ') + ('...' if len(detail) > 60 else '')
+        detail_item = QTableWidgetItem(detail_short if detail_short else '（待获取）')
+        if detail:
+            detail_item.setToolTip(detail)
+        else:
+            detail_item.setForeground(QColor("#bdc3c7"))
+        self.job_table.setItem(row, 8, detail_item)
+
+        mode = job.get('delivery_mode', 'api')
+        mode_item = QTableWidgetItem("API" if mode == "api" else "浏览器")
+        self.job_table.setItem(row, 9, mode_item)
+
+        status_map = {0: "待投递", 1: "已投递", 2: "投递失败", 3: "无需投递", 4: "匹配不足", 5: "时间不符"}
+        status_text = status_map.get(job.get('status', 0), "待投递")
+        status_item = QTableWidgetItem(status_text)
+        colors = {"已投递": "#27ae60", "投递失败": "#e74c3c", "无需投递": "#f39c12",
+                  "匹配不足": "#e67e22", "时间不符": "#95a5a6"}
+        status_item.setForeground(QColor(colors.get(status_text, "#7f8c8d")))
+        self.job_table.setItem(row, 10, status_item)
+
+
 # ==================== 自动投递页签 ====================
 
 class AutoDeliveryTab(QWidget):
     """自动投递页签 — 支持API/浏览器双模式"""
 
     def __init__(self, api_client: BOSSApiClient, db: JobDatabase,
-                 analyzer: ResumeAnalyzer, account_tab: AccountTab = None, parent=None):
+                 analyzer: ResumeAnalyzer, job_list_tab: JobListTab = None,
+                 account_tab: AccountTab = None, parent=None):
         super().__init__(parent)
         self.api_client = api_client
         self.db = db
         self.analyzer = analyzer
+        self.job_list_tab = job_list_tab
         self.account_tab = account_tab
         self._auto_worker: Optional[AutoDeliverWorker] = None
         self._browser_deliverer: Optional[BossBrowserDeliverer] = None
@@ -3814,43 +4027,6 @@ class AutoDeliveryTab(QWidget):
         self.status_label.setStyleSheet("color: #94a3b8;")
         layout.addWidget(self.status_label)
 
-        # 岗位列表（11列）
-        self.job_table = QTableWidget()
-        self.job_table.setColumnCount(11)
-        self.job_table.setHorizontalHeaderLabels([
-            "岗位名称", "公司", "地区", "薪资", "活跃时间", "活跃描述",
-            "匹配度", "原因", "岗位详情", "投递模式", "状态"
-        ])
-        self.job_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.job_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.job_table.setAlternatingRowColors(True)
-        header = self.job_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.Fixed)
-        header.setSectionResizeMode(3, QHeaderView.Fixed)
-        header.setSectionResizeMode(4, QHeaderView.Fixed)
-        header.setSectionResizeMode(5, QHeaderView.Fixed)
-        header.setSectionResizeMode(6, QHeaderView.Fixed)
-        header.setSectionResizeMode(7, QHeaderView.Fixed)
-        header.setSectionResizeMode(8, QHeaderView.Stretch)
-        header.setSectionResizeMode(9, QHeaderView.Fixed)
-        header.setSectionResizeMode(10, QHeaderView.Fixed)
-        header.setStretchLastSection(False)
-        self.job_table.setColumnWidth(1, 80)
-        self.job_table.setColumnWidth(2, 50)
-        self.job_table.setColumnWidth(3, 65)
-        self.job_table.setColumnWidth(4, 65)
-        self.job_table.setColumnWidth(5, 55)
-        self.job_table.setColumnWidth(6, 48)
-        self.job_table.setColumnWidth(7, 70)
-        self.job_table.setColumnWidth(9, 50)
-        self.job_table.setColumnWidth(10, 50)
-        self.job_table.setMinimumHeight(180)
-        self.job_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.job_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        layout.addWidget(self.job_table, stretch=1)
-
         # 统计信息
         stats_group = QGroupBox("投递统计")
         stats_layout = QFormLayout(stats_group)
@@ -3872,10 +4048,10 @@ class AutoDeliveryTab(QWidget):
         stats_layout.addRow("今日：", daily_row)
         layout.addWidget(stats_group)
 
-        self._job_row_map: Dict[str, int] = {}
-
         # 加载上次投递配置
         self._load_config()
+        # 加载今日投递统计
+        self._load_daily_stats()
 
     def _load_config(self):
         """从 config.json 恢复上次投递配置"""
@@ -3974,8 +4150,8 @@ class AutoDeliveryTab(QWidget):
         self.progress_bar.setValue(0)
         self.status_label.setText(f"正在自动投递（{mode_desc}）...")
         self.status_label.setStyleSheet("color: #f59e0b;")
-        self.job_table.setRowCount(0)
-        self._job_row_map.clear()
+        if self.job_list_tab:
+            self.job_list_tab.clear()
 
         # 浏览器模式：初始化DrissionPage
         browser_deliverer = None
@@ -3989,7 +4165,8 @@ class AutoDeliveryTab(QWidget):
                 co.set_argument('--window-position=-32000,-32000')  # 窗口移到屏幕外，后台运行
                 co.set_argument('--window-size=1280,800')
                 page = ChromiumPage(co)
-                browser_deliverer = BossBrowserDeliverer(page, self.analyzer)
+                browser_deliverer = BossBrowserDeliverer(page, self.analyzer,
+                    log_callback=lambda msg: _log_emitter.log_signal.emit(msg))
                 self._browser_deliverer = browser_deliverer
             except Exception as e:
                 _log_emitter.log_signal.emit(_log_fmt("投递", f"浏览器初始化失败: {e}"))
@@ -4011,111 +4188,20 @@ class AutoDeliveryTab(QWidget):
         self._auto_worker.log_signal.connect(
             lambda msg: _log_emitter.log_signal.emit(msg))
         self._auto_worker.all_done.connect(self._on_done)
+        self._auto_worker.daily_limit_reached.connect(self._on_daily_limit)
         self._auto_worker.start()
 
-    def _fill_job_table_row(self, row: int, url: str, job: dict):
-        self._job_row_map[url] = row
-
-        title = job.get('title', '')
-        title_item = QTableWidgetItem(title)
-        title_item.setToolTip(title)
-        self.job_table.setItem(row, 0, title_item)
-
-        company = job.get('company', '未知')
-        company_item = QTableWidgetItem(company)
-        company_item.setToolTip(f"{company}\n{job.get('company_scale', '')} | {job.get('company_stage', '')} | {job.get('company_industry', '')}")
-        self.job_table.setItem(row, 1, company_item)
-
-        location = job.get('location', job.get('city', ''))
-        district = job.get('district', '')
-        loc_text = f"{location} {district}".strip() if district else location
-        loc_item = QTableWidgetItem(loc_text)
-        loc_item.setToolTip(loc_text)
-        self.job_table.setItem(row, 2, loc_item)
-
-        salary_item = QTableWidgetItem(job.get('salary', ''))
-        salary_item.setToolTip(job.get('salary', ''))
-        self.job_table.setItem(row, 3, salary_item)
-
-        active_time = job.get('active_time', 0)
-        if active_time > 0:
-            active_dt = datetime.fromtimestamp(active_time / 1000.0)
-            active_date_str = active_dt.strftime("%Y-%m-%d")
-            active_tip = active_dt.strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            active_date_str = ''
-            active_tip = ''
-        at_item = QTableWidgetItem(active_date_str)
-        at_item.setToolTip(active_tip)
-        self.job_table.setItem(row, 4, at_item)
-
-        active_desc = job.get('active_time_desc', '')
-        ad_item = QTableWidgetItem(active_desc)
-        ad_item.setToolTip(active_desc)
-        self.job_table.setItem(row, 5, ad_item)
-
-        score_val = job.get('match_score', 0)
-        score_item = QTableWidgetItem(str(score_val))
-        if score_val >= 80:
-            score_item.setForeground(QColor("#27ae60"))
-        elif score_val >= 60:
-            score_item.setForeground(QColor("#f39c12"))
-        else:
-            score_item.setForeground(QColor("#e74c3c"))
-        self.job_table.setItem(row, 6, score_item)
-
-        match_detail = job.get('_match_detail', {}) or {}
-        reasons = match_detail.get('reasons', [])
-        reason_text = reasons[0] if reasons else '-'
-        reason_item = QTableWidgetItem(reason_text)
-        tip_lines = [f"综合匹配度: {score_val}分"]
-        if reasons:
-            for r in reasons:
-                tip_lines.append(f"  + {r}")
-        reason_item.setToolTip('\n'.join(tip_lines))
-        self.job_table.setItem(row, 7, reason_item)
-
-        detail = job.get('job_detail', '')
-        detail_short = detail[:60].replace('\n', ' ') + ('...' if len(detail) > 60 else '')
-        detail_item = QTableWidgetItem(detail_short if detail_short else '（待获取）')
-        if detail:
-            detail_item.setToolTip(detail)
-        else:
-            detail_item.setForeground(QColor("#bdc3c7"))
-        self.job_table.setItem(row, 8, detail_item)
-
-        mode = job.get('delivery_mode', 'api')
-        mode_item = QTableWidgetItem("API" if mode == "api" else "浏览器")
-        self.job_table.setItem(row, 9, mode_item)
-
-        status_map = {0: "待投递", 1: "已投递", 2: "投递失败", 3: "无需投递", 4: "匹配不足", 5: "时间不符"}
-        status_text = status_map.get(job.get('status', 0), "待投递")
-        status_item = QTableWidgetItem(status_text)
-        colors = {"已投递": "#27ae60", "投递失败": "#e74c3c", "无需投递": "#f39c12",
-                  "匹配不足": "#e67e22", "时间不符": "#95a5a6"}
-        status_item.setForeground(QColor(colors.get(status_text, "#7f8c8d")))
-        self.job_table.setItem(row, 10, status_item)
-
     def _on_auto_job_found(self, url, job):
-        row = self.job_table.rowCount()
-        self.job_table.insertRow(row)
-        self._fill_job_table_row(row, url, job)
+        if self.job_list_tab:
+            self.job_list_tab.add_job(url, job)
 
     def _on_auto_job_enriched(self, url, job):
-        if url in self._job_row_map:
-            row = self._job_row_map[url]
-        else:
-            row = self.job_table.rowCount()
-            self.job_table.insertRow(row)
-        self._fill_job_table_row(row, url, job)
+        if self.job_list_tab:
+            self.job_list_tab.update_job(url, job)
 
     def _on_auto_job_result(self, url, success):
-        if url in self._job_row_map:
-            row = self._job_row_map[url]
-            status_text = "已投递" if success else "投递失败"
-            status_item = QTableWidgetItem(status_text)
-            status_item.setForeground(QColor("#27ae60" if success else "#e74c3c"))
-            self.job_table.setItem(row, 10, status_item)
+        if self.job_list_tab:
+            self.job_list_tab.update_result(url, success)
 
     def _on_progress(self, current, total, status):
         self.progress_bar.setValue(current)
@@ -4146,6 +4232,24 @@ class AutoDeliveryTab(QWidget):
             self.stop_btn.setEnabled(False)
             self.status_label.setText("正在停止...")
             self.status_label.setStyleSheet("color: #ef4444;")
+
+    def _on_daily_limit(self):
+        """每日沟通上限触发：停止投递，弹窗提示"""
+        if self._auto_worker:
+            self._auto_worker.stop()
+        _log_emitter.log_signal.emit(_log_fmt("投递", "触发每日沟通上限，停止投递"))
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.progress_bar.setVisible(False)
+        self.status_label.setText("每日上限已达，请手动处理")
+        self.status_label.setStyleSheet("color: #ef4444;")
+        self._update_session_stats()
+        self._auto_worker = None
+        QMessageBox.warning(
+            self, "每日沟通上限",
+            "已达到BOSS直聘每日120次沟通上限！\n\n"
+            "请在BOSS直聘网页/APP中手动点击「开聊」按钮，\n"
+            "完成验证后可继续使用本工具投递。")
 
     def _update_session_stats(self):
         if not self._auto_worker:
@@ -4185,8 +4289,9 @@ class MainWindow(QMainWindow):
 
         self.job_db = JobDatabase()
 
-        # 初始化AI分析器
+        # 初始化AI分析器（连接日志回调，确保AI日志写入文件）
         self.analyzer = ResumeAnalyzer()
+        self.analyzer.log_callback = lambda msg: _log_emitter.log_signal.emit(msg)
 
         # 自动恢复简历文本（上次AI分析时保存的）
         try:
@@ -4198,8 +4303,9 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # 初始化API客户端
-        self.api_client = BOSSApiClient()
+        # 初始化API客户端（连接日志回调，确保API日志写入文件）
+        self.api_client = BOSSApiClient(
+            log_callback=lambda msg: _log_emitter.log_signal.emit(msg))
 
         # 自动提取Cookie
         self._auto_login()
@@ -4210,7 +4316,8 @@ class MainWindow(QMainWindow):
     def _auto_login(self):
         """尝试自动从浏览器提取Cookie登录"""
         try:
-            auth = BrowserAuthHelper()
+            auth = BrowserAuthHelper(
+                log_callback=lambda msg: _log_emitter.log_signal.emit(msg))
             cookies = auth.extract_cookies()
             if cookies:
                 cookie_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
@@ -4240,13 +4347,15 @@ class MainWindow(QMainWindow):
         self.resume_tab = ResumeTab(self.analyzer)
         self.tab_widget.addTab(self.resume_tab, "简历管理")
 
-        # Tab 2: 自动投递（核心）
-        self.auto_tab = AutoDeliveryTab(self.api_client, self.job_db, self.analyzer, self.account_tab)
-        self.tab_widget.addTab(self.auto_tab, "自动投递")
+        # Tab 2: 岗位列表（先创建，供自动投递引用）
+        self.job_list_tab = JobListTab()
+        self.tab_widget.addTab(self.job_list_tab, "岗位列表")
 
-        # Tab 3: 投递记录
-        self.record_tab = RecordTab(self.job_db)
-        self.tab_widget.addTab(self.record_tab, "投递记录")
+        # Tab 3: 自动投递（核心）
+        self.auto_tab = AutoDeliveryTab(self.api_client, self.job_db, self.analyzer,
+                                        job_list_tab=self.job_list_tab,
+                                        account_tab=self.account_tab)
+        self.tab_widget.addTab(self.auto_tab, "自动投递")
 
         main_layout.addWidget(self.tab_widget)
 
