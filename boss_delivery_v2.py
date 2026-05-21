@@ -3473,13 +3473,15 @@ class AutoDeliverWorker(QThread):
                     self.progress.emit(delivered_count, self.target_count,
                         f"分析岗位 (第{page}页 {idx+1}/{len(new_jobs)}): {job.get('title', '')}")
 
-                    security_id = job.get("_security_id", "")
-                    lid = job.get("_lid", "")
-                    detail_ok = False
                     job.setdefault("platform", "boss")
                     job.setdefault("active_time", 0)
                     job.setdefault("active_time_desc", "")
                     job.setdefault("delivery_mode", "api")
+                    self.job_found.emit(url, job)
+
+                    security_id = job.get("_security_id", "")
+                    lid = job.get("_lid", "")
+                    detail_ok = False
 
                     if security_id:
                         detail = self.api_client._get_job_detail_real(security_id, lid)
@@ -3599,6 +3601,9 @@ class AutoDeliverWorker(QThread):
                     if self.db.is_delivered(job_url) or self.db.is_skipped(job_url):
                         continue
 
+                    job_info.setdefault("delivery_mode", "browser")
+                    self.job_found.emit(job_url, job_info)
+
                     self.progress.emit(delivered_count, self.target_count,
                                      f"分析: {title}@{company}")
 
@@ -3628,6 +3633,7 @@ class AutoDeliverWorker(QThread):
                     self.db.add_job(job_url_safe, title=title, company=company,
                                     status=0, match_score=match_score,
                                     platform="boss", delivery_mode="browser")
+                    self.job_enriched.emit(job_url_safe, job_info)
 
                     # 筛选
                     if has_resume and match_score < self.min_score:
@@ -4347,15 +4353,17 @@ class MainWindow(QMainWindow):
         self.resume_tab = ResumeTab(self.analyzer)
         self.tab_widget.addTab(self.resume_tab, "简历管理")
 
-        # Tab 2: 岗位列表（先创建，供自动投递引用）
+        # 岗位列表（先创建实例供自动投递引用）
         self.job_list_tab = JobListTab()
-        self.tab_widget.addTab(self.job_list_tab, "岗位列表")
 
-        # Tab 3: 自动投递（核心）
+        # Tab 2: 自动投递（核心）
         self.auto_tab = AutoDeliveryTab(self.api_client, self.job_db, self.analyzer,
                                         job_list_tab=self.job_list_tab,
                                         account_tab=self.account_tab)
         self.tab_widget.addTab(self.auto_tab, "自动投递")
+
+        # Tab 3: 岗位列表
+        self.tab_widget.addTab(self.job_list_tab, "岗位列表")
 
         main_layout.addWidget(self.tab_widget)
 
