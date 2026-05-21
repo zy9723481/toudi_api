@@ -1263,6 +1263,7 @@ class BrowserAuthHelper:
         debug_port = 9222
         import socket
 
+        chrome_need_restart = False
         if chrome_running:
             self._log("CDP: 检测到Chrome正在运行，尝试连接现有调试端口...")
             for port in range(9222, 9240):
@@ -1275,10 +1276,45 @@ class BrowserAuthHelper:
                         resp = _req.get(f'http://127.0.0.1:{port}/json/version', timeout=2)
                         if resp.status_code == 200:
                             debug_port = port
+                            # 检测 --remote-allow-origins 是否已设置
+                            # 尝试WebSocket连接以验证
+                            try:
+                                page_resp = _req.get(f'http://127.0.0.1:{port}/json', timeout=2)
+                                tabs_test = page_resp.json()
+                                test_ws_url = None
+                                for t in tabs_test:
+                                    if t.get('webSocketDebuggerUrl'):
+                                        test_ws_url = t['webSocketDebuggerUrl']
+                                        break
+                                if test_ws_url:
+                                    import websocket as _ws_test
+                                    test_ws = _ws_test.create_connection(test_ws_url, timeout=3)
+                                    test_ws.close()
+                            except Exception as ws_err:
+                                if '403' in str(ws_err) or 'Forbidden' in str(ws_err):
+                                    self._log(f"CDP: Chrome缺少 --remote-allow-origins=* 参数(403)，将自动重启Chrome")
+                                    chrome_need_restart = True
+                                    break
+                                # 其他WebSocket错误，重试下一个端口
+                                continue
                             self._log(f"CDP: 成功连接到现有Chrome调试端口 {port}")
                             break
                     except Exception:
                         continue
+            if chrome_need_restart:
+                # 杀掉旧Chrome进程，下面会重新启动
+                self._log("CDP: 正在关闭旧Chrome实例...")
+                try:
+                    _sp.check_call(['taskkill', '/F', '/IM', 'chrome.exe'],
+                                   stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                    time.sleep(2)
+                    chrome_running = False
+                except Exception:
+                    self._log("CDP: 无法自动关闭Chrome，请手动关闭后重试")
+                    self._log(f"CDP: 或手动以正确参数启动: \"{chrome_exe}\" --remote-debugging-port=9222 --remote-allow-origins=*")
+                    return None
+            elif not chrome_need_restart and debug_port:
+                pass  # 已成功连接
             else:
                 platform_name = "BOSS直聘" if platform == 'boss' else "智联招聘"
                 self._log(f"CDP: Chrome运行中且无调试端口，无法获取实时{platform_name}Cookie")
@@ -4172,6 +4208,7 @@ class AutoDeliveryTab(QWidget):
                 co.set_argument('--disable-blink-features=AutomationControlled')
                 co.set_argument('--disable-dev-shm-usage')
                 co.set_argument('--disable-gpu')
+                co.set_argument('--remote-allow-origins=*')
                 co.set_argument('--window-position=-32000,-32000')  # 窗口移到屏幕外，后台运行
                 co.set_argument('--window-size=1280,800')
                 page = ChromiumPage(co)
