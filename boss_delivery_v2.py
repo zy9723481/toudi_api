@@ -255,7 +255,10 @@ class LogEmitter(QObject):
 _log_emitter = LogEmitter()
 
 # 脚本所在目录（PyInstaller打包后为exe所在目录）
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, 'frozen', False):
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def setup_file_logging():
@@ -283,7 +286,7 @@ def _log_fmt(prefix: str, msg: str) -> str:
 
 def _config_path(filename: str = "config.json") -> str:
     """获取配置文件完整路径"""
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    return os.path.join(SCRIPT_DIR, filename)
 
 
 def save_delivery_config(keyword: str = "", location: str = "", min_score: int = 60,
@@ -628,7 +631,7 @@ class JobDatabase:
         self._init_db()
 
     def _get_path(self):
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), self.DB_FILE)
+        return os.path.join(SCRIPT_DIR, self.DB_FILE)
 
     def _init_db(self):
         import sqlite3
