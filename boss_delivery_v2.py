@@ -1324,7 +1324,10 @@ class BrowserAuthHelper:
         if not os.path.exists(chrome_dir):
             return None
 
+        # 优先选Default，其次选BOSS直聘Cookie最多的profile
         target_profile = 'Default'
+        best_count = 0
+        default_count = 0
         for profile_name in sorted(os.listdir(chrome_dir)):
             profile_path = os.path.join(chrome_dir, profile_name)
             if not os.path.isdir(profile_path):
@@ -1341,11 +1344,17 @@ class BrowserAuthHelper:
                     count = cur.fetchone()[0]
                     conn.close()
                     os.remove(tmp)
-                    if count > 0:
+                    if profile_name == 'Default':
+                        default_count = count
+                    if count > best_count:
+                        best_count = count
                         target_profile = profile_name
-                        break
                 except Exception:
                     pass
+        # 如果Default也有Cookie，优先用Default（确保最新登录的profile）
+        if default_count > 0:
+            target_profile = 'Default'
+        self._log(f"CDP: 选用Chrome profile={target_profile} (Cookie数={best_count})")
 
         import subprocess as _sp
         chrome_running = False
@@ -1501,6 +1510,22 @@ class BrowserAuthHelper:
             platform_name = "BOSS直聘" if platform == 'boss' else "智联招聘"
             self._log(f"CDP: 已导航到{platform_name}，等待JS生成最新token(8秒)...")
             time.sleep(8)
+
+            # 导航后重新获取WebSocket URL（页面切换后URL可能已变）
+            try:
+                resp2 = _req.get(f'http://127.0.0.1:{debug_port}/json', timeout=5)
+                tabs2 = resp2.json()
+                ws_url2 = None
+                for t in tabs2:
+                    if main_domain in t.get('url', ''):
+                        ws_url2 = t.get('webSocketDebuggerUrl', '')
+                        break
+                if not ws_url2 and tabs2:
+                    ws_url2 = tabs2[0].get('webSocketDebuggerUrl', '')
+                if ws_url2:
+                    ws_url = ws_url2
+            except Exception:
+                pass  # 保留原ws_url
         except Exception as e:
             self._log(f"CDP: 页面导航失败({e})，使用现有页面继续提取...")
 
