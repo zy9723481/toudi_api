@@ -260,6 +260,47 @@ if getattr(sys, 'frozen', False):
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 机器码缓存（首次生成立即缓存）
+_MACHINE_CODE = None
+
+
+def get_machine_code() -> str:
+    """生成机器唯一标识码，用于多机器去重隔离"""
+    global _MACHINE_CODE
+    if _MACHINE_CODE:
+        return _MACHINE_CODE
+
+    import hashlib
+    parts = []
+
+    # 1. MAC地址
+    try:
+        mac = uuid.getnode()
+        parts.append(f"mac:{mac:012x}")
+    except Exception:
+        pass
+
+    # 2. Windows MachineGuid (注册表)
+    if os.name == 'nt':
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r"SOFTWARE\Microsoft\Cryptography")
+            guid, _ = winreg.QueryValueEx(key, "MachineGuid")
+            winreg.CloseKey(key)
+            parts.append(f"guid:{guid}")
+        except Exception:
+            pass
+
+    # 3. 兜底：计算机名 + 用户名
+    if len(parts) < 2:
+        parts.append(f"host:{os.environ.get('COMPUTERNAME', '')}")
+        parts.append(f"user:{os.environ.get('USERNAME', '')}")
+
+    raw = "|".join(parts)
+    _MACHINE_CODE = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    return _MACHINE_CODE
+
 
 def setup_file_logging():
     """将日志信号同时写入脚本目录下的日志文件（每次启动覆盖）"""
@@ -628,6 +669,7 @@ class JobDatabase:
     DB_FILE = "jobs_delivery_v2.db"
 
     def __init__(self):
+        self._machine_code = get_machine_code()
         self._init_db()
 
     def _get_path(self):
@@ -637,28 +679,69 @@ class JobDatabase:
         import sqlite3
         conn = sqlite3.connect(self._get_path())
         cur = conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS delivered_jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_url TEXT UNIQUE NOT NULL,
-            title TEXT DEFAULT '',
-            company TEXT DEFAULT '',
-            status INTEGER DEFAULT 0,
-            match_score INTEGER DEFAULT 0,
-            platform TEXT DEFAULT 'boss',
-            delivery_mode TEXT DEFAULT 'api',
-            greeting TEXT DEFAULT '',
-            active_time INTEGER DEFAULT 0,
-            active_time_desc TEXT DEFAULT '',
-            created_at TEXT DEFAULT '',
-            updated_at TEXT DEFAULT ''
-        )""")
+
+        # 检查是否需要迁移（旧表无machine_code列）
+        cur.execute("PRAGMA table_info(delivered_jobs)")
+        columns = [row[1] for row in cur.fetchall()]
+        need_migrate = 'machine_code' not in columns
+
+        if need_migrate and columns:
+            # 迁移旧数据：重建表，新UNIQUE=(machine_code, job_url)
+            cur.execute("ALTER TABLE delivered_jobs RENAME TO delivered_jobs_old")
+            cur.execute("""CREATE TABLE delivered_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                machine_code TEXT NOT NULL DEFAULT '',
+                job_url TEXT NOT NULL,
+                title TEXT DEFAULT '',
+                company TEXT DEFAULT '',
+                status INTEGER DEFAULT 0,
+                match_score INTEGER DEFAULT 0,
+                platform TEXT DEFAULT 'boss',
+                delivery_mode TEXT DEFAULT 'api',
+                greeting TEXT DEFAULT '',
+                active_time INTEGER DEFAULT 0,
+                active_time_desc TEXT DEFAULT '',
+                created_at TEXT DEFAULT '',
+                updated_at TEXT DEFAULT '',
+                UNIQUE(machine_code, job_url)
+            )""")
+            # 将旧数据迁移，machine_code用本机码
+            cur.execute(f"""INSERT OR IGNORE INTO delivered_jobs
+                (machine_code, job_url, title, company, status, match_score,
+                 platform, delivery_mode, greeting, active_time, active_time_desc,
+                 created_at, updated_at)
+                SELECT '{self._machine_code}', job_url, title, company, status, match_score,
+                       platform, delivery_mode, greeting, active_time, active_time_desc,
+                       created_at, updated_at
+                FROM delivered_jobs_old""")
+            cur.execute("DROP TABLE delivered_jobs_old")
+        else:
+            cur.execute("""CREATE TABLE IF NOT EXISTS delivered_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                machine_code TEXT NOT NULL DEFAULT '',
+                job_url TEXT NOT NULL,
+                title TEXT DEFAULT '',
+                company TEXT DEFAULT '',
+                status INTEGER DEFAULT 0,
+                match_score INTEGER DEFAULT 0,
+                platform TEXT DEFAULT 'boss',
+                delivery_mode TEXT DEFAULT 'api',
+                greeting TEXT DEFAULT '',
+                active_time INTEGER DEFAULT 0,
+                active_time_desc TEXT DEFAULT '',
+                created_at TEXT DEFAULT '',
+                updated_at TEXT DEFAULT '',
+                UNIQUE(machine_code, job_url)
+            )""")
+
         cur.execute("""CREATE TABLE IF NOT EXISTS delivery_stats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine_code TEXT NOT NULL DEFAULT '',
             date TEXT NOT NULL,
             platform TEXT DEFAULT 'boss',
             delivery_mode TEXT DEFAULT 'api',
             count INTEGER DEFAULT 0,
-            UNIQUE(date, platform, delivery_mode)
+            UNIQUE(machine_code, date, platform, delivery_mode)
         )""")
         conn.commit()
         conn.close()
@@ -667,7 +750,8 @@ class JobDatabase:
         import sqlite3
         conn = sqlite3.connect(self._get_path())
         cur = conn.cursor()
-        cur.execute("SELECT id FROM delivered_jobs WHERE job_url=? AND status=1", (job_url,))
+        cur.execute("SELECT id FROM delivered_jobs WHERE machine_code=? AND job_url=? AND status=1",
+                   (self._machine_code, job_url))
         result = cur.fetchone()
         conn.close()
         return result is not None
@@ -676,7 +760,8 @@ class JobDatabase:
         import sqlite3
         conn = sqlite3.connect(self._get_path())
         cur = conn.cursor()
-        cur.execute("SELECT id FROM delivered_jobs WHERE job_url=? AND status IN (2,4,5)", (job_url,))
+        cur.execute("SELECT id FROM delivered_jobs WHERE machine_code=? AND job_url=? AND status IN (2,4,5)",
+                   (self._machine_code, job_url))
         result = cur.fetchone()
         conn.close()
         return result is not None
@@ -689,10 +774,11 @@ class JobDatabase:
         conn = sqlite3.connect(self._get_path())
         cur = conn.cursor()
         cur.execute("""INSERT OR REPLACE INTO delivered_jobs
-            (job_url, title, company, status, match_score, platform, delivery_mode, greeting,
+            (machine_code, job_url, title, company, status, match_score, platform, delivery_mode, greeting,
              active_time, active_time_desc, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (job_url, title, company, status, match_score, platform, delivery_mode, greeting,
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (self._machine_code, job_url, title, company, status, match_score,
+             platform, delivery_mode, greeting,
              active_time, active_time_desc, now, now))
         conn.commit()
         conn.close()
@@ -703,11 +789,13 @@ class JobDatabase:
         conn = sqlite3.connect(self._get_path())
         cur = conn.cursor()
         if match_score > 0:
-            cur.execute("UPDATE delivered_jobs SET status=?, match_score=?, updated_at=? WHERE job_url=?",
-                       (status, match_score, now, job_url))
+            cur.execute("UPDATE delivered_jobs SET status=?, match_score=?, updated_at=? "
+                       "WHERE machine_code=? AND job_url=?",
+                       (status, match_score, now, self._machine_code, job_url))
         else:
-            cur.execute("UPDATE delivered_jobs SET status=?, updated_at=? WHERE job_url=?",
-                       (status, now, job_url))
+            cur.execute("UPDATE delivered_jobs SET status=?, updated_at=? "
+                       "WHERE machine_code=? AND job_url=?",
+                       (status, now, self._machine_code, job_url))
         conn.commit()
         conn.close()
 
@@ -718,12 +806,14 @@ class JobDatabase:
         cur = conn.cursor()
         if delivery_mode:
             cur.execute(
-                "SELECT COUNT(*) as cnt FROM delivered_jobs WHERE platform=? AND delivery_mode=? AND status=1 AND date(updated_at)=?",
-                (platform, delivery_mode, today))
+                "SELECT COUNT(*) as cnt FROM delivered_jobs "
+                "WHERE machine_code=? AND platform=? AND delivery_mode=? AND status=1 AND date(updated_at)=?",
+                (self._machine_code, platform, delivery_mode, today))
         else:
             cur.execute(
-                "SELECT COUNT(*) as cnt FROM delivered_jobs WHERE platform=? AND status=1 AND date(updated_at)=?",
-                (platform, today))
+                "SELECT COUNT(*) as cnt FROM delivered_jobs "
+                "WHERE machine_code=? AND platform=? AND status=1 AND date(updated_at)=?",
+                (self._machine_code, platform, today))
         result = cur.fetchone()
         conn.close()
         return result[0] if result else 0
@@ -733,15 +823,15 @@ class JobDatabase:
         conn = sqlite3.connect(self._get_path())
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        conditions = []
-        params = []
+        conditions = ["machine_code=?"]
+        params = [self._machine_code]
         if platform:
             conditions.append("platform=?")
             params.append(platform)
         if delivery_mode:
             conditions.append("delivery_mode=?")
             params.append(delivery_mode)
-        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        where = " WHERE " + " AND ".join(conditions)
         cur.execute(f"SELECT * FROM delivered_jobs{where} ORDER BY updated_at DESC LIMIT ?",
                    params + [limit])
         rows = [dict(r) for r in cur.fetchall()]
@@ -749,27 +839,29 @@ class JobDatabase:
         return rows
 
     def exists(self, job_url: str) -> bool:
-        """检查岗位URL是否已在数据库中（任意状态）"""
+        """检查岗位URL是否已在数据库中（本机、任意状态）"""
         import sqlite3
         conn = sqlite3.connect(self._get_path())
         cur = conn.cursor()
-        cur.execute("SELECT id FROM delivered_jobs WHERE job_url=?", (job_url,))
+        cur.execute("SELECT id FROM delivered_jobs WHERE machine_code=? AND job_url=?",
+                   (self._machine_code, job_url))
         result = cur.fetchone()
         conn.close()
         return result is not None
 
     def get_status(self, job_url: str) -> int:
-        """获取岗位状态，不存在返回-1"""
+        """获取岗位状态（本机），不存在返回-1"""
         import sqlite3
         conn = sqlite3.connect(self._get_path())
         cur = conn.cursor()
-        cur.execute("SELECT status FROM delivered_jobs WHERE job_url=?", (job_url,))
+        cur.execute("SELECT status FROM delivered_jobs WHERE machine_code=? AND job_url=?",
+                   (self._machine_code, job_url))
         row = cur.fetchone()
         conn.close()
         return row[0] if row else -1
 
     def filter_new_jobs(self, jobs: Dict) -> Dict:
-        """过滤已投递/处理中的岗位，跳过低分/失败的可重新评估
+        """过滤已投递/处理中的岗位，跳过低分/失败的可重新评估（本机隔离）
         状态说明: 0=待投递 1=已投递(严禁重投) 2=失败 3=无详情 4=低分跳过
         仅过滤状态0和1，状态2/3/4允许重新进入投递流程"""
         new_jobs = {}
@@ -790,8 +882,9 @@ class JobDatabase:
         cur = conn.cursor()
         cur.execute(
             "SELECT platform, delivery_mode, COUNT(*) as cnt FROM delivered_jobs "
-            "WHERE status=1 AND date(updated_at)=? GROUP BY platform, delivery_mode",
-            (date,))
+            "WHERE machine_code=? AND status=1 AND date(updated_at)=? "
+            "GROUP BY platform, delivery_mode",
+            (self._machine_code, date))
         rows = cur.fetchall()
         conn.close()
         stats = {'api': 0, 'browser': 0, 'total': 0}
