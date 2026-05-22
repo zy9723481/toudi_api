@@ -861,17 +861,15 @@ class JobDatabase:
         return row[0] if row else -1
 
     def filter_new_jobs(self, jobs: Dict) -> Dict:
-        """过滤已投递/处理中的岗位，跳过低分/失败的可重新评估（本机隔离）
+        """过滤已投递岗位，允许待投递/失败/低分重新评估（本机隔离）
         状态说明: 0=待投递 1=已投递(严禁重投) 2=失败 3=无详情 4=低分跳过
-        仅过滤状态0和1，状态2/3/4允许重新进入投递流程"""
+        仅过滤status=1（已投递成功），其余均允许重新进入投递流程
+        status=0（上次中断残留的待投递）也会被重新处理，内存级去重由worker负责"""
         new_jobs = {}
         for url, job in jobs.items():
             status = self.get_status(url)
-            if status < 0:
-                new_jobs[url] = job  # 全新岗位
-            elif status >= 2:
-                new_jobs[url] = job  # 失败/无详情/低分 → 允许重新评估
-            # status 0/1 → 过滤掉（待投递中 / 已投递成功）
+            if status != 1:  # 仅过滤已投递成功
+                new_jobs[url] = job
         return new_jobs
 
     def get_daily_stats(self, date: str = None) -> dict:
@@ -1800,6 +1798,7 @@ class BOSSApiClient:
         self._api_lock = threading.RLock()     # 序列化所有API调用
         self._last_api_call = 0                # 上次API调用时间戳
         self._min_api_interval = 10            # 最小API调用间隔（秒）
+        self._min_search_interval = 5          # 搜索API最小间隔（秒），搜索对风控敏感度较低
         self._last_delivery_time = 0           # 上次投递时间戳
         self._min_delivery_interval = 30       # 投递最小间隔（秒），投递端点更敏感
         self.daily_limit_reached = False       # 是否触发每日120次沟通上限
@@ -1941,10 +1940,12 @@ class BOSSApiClient:
             return None
 
         with self._api_lock:
-            # 冷却等待：确保两次API调用间隔≥10秒
+            # 冷却等待：搜索使用较短间隔(5s)，其他使用常规间隔(10s)
+            is_search = (path == self.SEARCH_URL)
+            min_interval = self._min_search_interval if is_search else self._min_api_interval
             elapsed = time.time() - self._last_api_call
-            if elapsed < self._min_api_interval:
-                wait = self._min_api_interval - elapsed + random.uniform(0, 2)
+            if elapsed < min_interval:
+                wait = min_interval - elapsed + random.uniform(0, 2)
                 if wait > 0.5:
                     self._log(f"[{action}] API冷却 {wait:.1f}秒...")
                 time.sleep(wait)
@@ -1969,12 +1970,18 @@ class BOSSApiClient:
                 elif code == 37:
                     self._consecutive_37_count += 1
                     self._log(f"[{action}] 需要重新验证(第{self._consecutive_37_count}次)")
-                    if self._consecutive_37_count >= 3 or retry_on_expire:
-                        self._log(f"[{action}] 正在自动刷新验证信息...")
-                        if self.refresh_cookies_from_browser():
-                            self._consecutive_37_count = 0
-                            time.sleep(2)
-                            return self._api_get(path, params, action, retry_on_expire=False)
+                    # 指数退避：先等待而不是立即刷新Cookie，减少频繁CDP调用
+                    if self._consecutive_37_count <= 3:
+                        wait_37 = [30, 60, 120][self._consecutive_37_count - 1]
+                        self._log(f"[{action}] {wait_37}秒后退避重试({self._consecutive_37_count}/3)...")
+                        time.sleep(wait_37)
+                        return self._api_get(path, params, action, retry_on_expire=False)
+                    # 3次退避后仍失败，刷新Cookie
+                    self._log(f"[{action}] 退避用尽，正在刷新Cookie...")
+                    if self.refresh_cookies_from_browser():
+                        self._consecutive_37_count = 0
+                        time.sleep(2)
+                        return self._api_get(path, params, action, retry_on_expire=False)
                     return None
                 elif code in (1, 9):
                     # "开聊提醒" = 每日120次沟通上限，必须手动在APP触发，重试无效
@@ -2018,7 +2025,7 @@ class BOSSApiClient:
             return None
 
         with self._api_lock:
-            # 冷却等待：确保两次API调用间隔≥10秒
+            # 冷却等待：POST请求使用常规间隔(10s)
             elapsed = time.time() - self._last_api_call
             if elapsed < self._min_api_interval:
                 wait = self._min_api_interval - elapsed + random.uniform(0, 2)
@@ -2046,12 +2053,18 @@ class BOSSApiClient:
                 elif code == 37:
                     self._consecutive_37_count += 1
                     self._log(f"[{action}] 需要重新验证(第{self._consecutive_37_count}次)")
-                    if self._consecutive_37_count >= 3 or retry_on_expire:
-                        self._log(f"[{action}] 正在自动刷新验证信息...")
-                        if self.refresh_cookies_from_browser():
-                            self._consecutive_37_count = 0
-                            time.sleep(2)
-                            return self._api_post(path, json_data, action, retry_on_expire=False)
+                    # 指数退避：先等待而不是立即刷新Cookie，减少频繁CDP调用
+                    if self._consecutive_37_count <= 3:
+                        wait_37 = [30, 60, 120][self._consecutive_37_count - 1]
+                        self._log(f"[{action}] {wait_37}秒后退避重试({self._consecutive_37_count}/3)...")
+                        time.sleep(wait_37)
+                        return self._api_post(path, json_data, action, retry_on_expire=False)
+                    # 3次退避后仍失败，刷新Cookie
+                    self._log(f"[{action}] 退避用尽，正在刷新Cookie...")
+                    if self.refresh_cookies_from_browser():
+                        self._consecutive_37_count = 0
+                        time.sleep(2)
+                        return self._api_post(path, json_data, action, retry_on_expire=False)
                     return None
                 elif code in (1, 9):
                     # "开聊提醒" = 每日120次沟通上限，必须手动在APP触发，重试无效
@@ -3634,6 +3647,7 @@ class AutoDeliverWorker(QThread):
         batch_counter = [0]
         count_lock = threading.Lock()
         has_resume = self.analyzer and self.analyzer.resume_text
+        seen_urls = set()  # 内存级去重，防止同一会话内重复处理
 
         def deliver_one(url: str, job: dict) -> tuple:
             nonlocal delivered_count, failed_count
@@ -3706,6 +3720,8 @@ class AutoDeliverWorker(QThread):
             self.api_client._cookie_refresh_count = 0
 
             page = 1
+            consecutive_empty = 0  # 连续空翻页计数
+            MAX_CONSECUTIVE_EMPTY = 5  # 连续5页全已投递则停止搜索
             while delivered_count < self.target_count and not self._stop_flag:
                 self.progress.emit(delivered_count, self.target_count, f"正在搜索第{page}页岗位...")
                 raw_jobs = self.api_client.fetch_jobs(
@@ -3718,11 +3734,19 @@ class AutoDeliverWorker(QThread):
                     break
 
                 new_jobs = self.db.filter_new_jobs(raw_jobs)
+                # 内存级去重：过滤本会话已处理过的URL
+                new_jobs = {u: j for u, j in new_jobs.items() if u not in seen_urls}
                 if not new_jobs:
+                    consecutive_empty += 1
+                    if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
+                        self.log_signal.emit(_log_fmt("投递",
+                            f"连续{consecutive_empty}页均为已投递岗位，自动停止搜索"))
+                        break
                     self.log_signal.emit(_log_fmt("投递", f"第{page}页均为已投递岗位，翻页"))
                     page += 1
                     time.sleep(1)
                     continue
+                consecutive_empty = 0  # 有岗位则重置
 
                 self.log_signal.emit(_log_fmt("投递",
                     f"第{page}页: {len(new_jobs)}个新岗位 → 开始逐条分析投递"))
@@ -3766,24 +3790,29 @@ class AutoDeliverWorker(QThread):
                             job["match_score"] = 50
 
                     enriched_count += 1
-                    self.db.add_job(
-                        job_url=url,
-                        title=job.get("title", ""),
-                        company=job.get("company", ""),
-                        status=job.get("status", 0),
-                        match_score=job.get("match_score", 0),
-                        active_time=job.get("active_time", 0),
-                        active_time_desc=job.get("active_time_desc", ""))
+                    seen_urls.add(url)
                     self.job_enriched.emit(url, job)
 
                     if has_resume and not detail_ok:
                         nodetail_count += 1
                         job['status'] = 3
+                        self.db.add_job(
+                            job_url=url, title=job.get("title", ""),
+                            company=job.get("company", ""), status=3,
+                            match_score=job.get("match_score", 0),
+                            active_time=job.get("active_time", 0),
+                            active_time_desc=job.get("active_time_desc", ""))
                         self.log_signal.emit(_log_fmt("投递",
                             f"⊙ {job.get('title')}@{job.get('company')} 无详情数据 → 跳过"))
                     elif has_resume and job.get('match_score', 0) < self.min_score:
                         skipped_count += 1
                         job['status'] = 4
+                        self.db.add_job(
+                            job_url=url, title=job.get("title", ""),
+                            company=job.get("company", ""), status=4,
+                            match_score=job.get("match_score", 0),
+                            active_time=job.get("active_time", 0),
+                            active_time_desc=job.get("active_time_desc", ""))
                         self.log_signal.emit(_log_fmt("投递",
                             f"跳过({job.get('match_score')}分) {job.get('title')}@{job.get('company')}"))
                     else:
@@ -3834,6 +3863,7 @@ class AutoDeliverWorker(QThread):
         delivered_count = 0
         failed_count = 0
         has_resume = self.analyzer and self.analyzer.resume_text
+        seen_urls = set()  # 内存级去重，防止同一会话内重复处理
 
         try:
             search_url = self.browser_deliverer.build_search_url(city_code, self.keyword)
@@ -3858,8 +3888,10 @@ class AutoDeliverWorker(QThread):
                     title = job_info.get('title', '')
                     company = job_info.get('company', '')
 
-                    # 去重
-                    if self.db.is_delivered(job_url) or self.db.is_skipped(job_url):
+                    # 去重：DB级 + 内存级
+                    if self.db.is_delivered(job_url):
+                        continue
+                    if job_url in seen_urls:
                         continue
 
                     job_info.setdefault("delivery_mode", "browser")
@@ -3871,6 +3903,14 @@ class AutoDeliverWorker(QThread):
                     # 获取详情
                     job_detail, hr_name = self.browser_deliverer.get_job_detail_and_hr(job_info)
                     if not job_detail:
+                        job_url_safe = job_url[:500]
+                        seen_urls.add(job_url_safe)
+                        self.db.add_job(job_url_safe, title=title, company=company,
+                                        status=3, match_score=0,
+                                        platform="boss", delivery_mode="browser")
+                        self.job_enriched.emit(job_url_safe, job_info)
+                        self.log_signal.emit(_log_fmt("投递",
+                            f"⊙ {title}@{company} 无详情数据 → 跳过"))
                         continue
 
                     job_info['job_detail'] = job_detail
@@ -3892,17 +3932,15 @@ class AutoDeliverWorker(QThread):
                         job_info["match_score"] = 50
 
                     match_score = job_info["match_score"]
-
-                    # 保存到数据库
                     job_url_safe = job_url[:500]
-                    self.db.add_job(job_url_safe, title=title, company=company,
-                                    status=0, match_score=match_score,
-                                    platform="boss", delivery_mode="browser")
+                    seen_urls.add(job_url_safe)
                     self.job_enriched.emit(job_url_safe, job_info)
 
-                    # 筛选
+                    # 筛选：低分跳过 → 直接写DB(status=4)
                     if has_resume and match_score < self.min_score:
-                        self.db.update_status(job_url_safe, 4, match_score)
+                        self.db.add_job(job_url_safe, title=title, company=company,
+                                        status=4, match_score=match_score,
+                                        platform="boss", delivery_mode="browser")
                         self.log_signal.emit(_log_fmt("投递",
                             f"跳过({match_score}分) {title}@{company}"))
                         continue
@@ -3925,10 +3963,14 @@ class AutoDeliverWorker(QThread):
 
                     if success:
                         delivered_count += 1
-                        self.db.update_status(job_url_safe, 1, match_score)
+                        self.db.add_job(job_url_safe, title=title, company=company,
+                                        status=1, match_score=match_score,
+                                        platform="boss", delivery_mode="browser")
                     else:
                         failed_count += 1
-                        self.db.update_status(job_url_safe, 2, match_score)
+                        self.db.add_job(job_url_safe, title=title, company=company,
+                                        status=2, match_score=match_score,
+                                        platform="boss", delivery_mode="browser")
 
                     self.job_result.emit(job_url_safe, success)
                     self.progress.emit(delivered_count, self.target_count,
