@@ -1972,9 +1972,14 @@ class BOSSApiClient:
                 elif code == 37:
                     self._consecutive_37_count += 1
                     self._log(f"[{action}] 需要重新验证(第{self._consecutive_37_count}次)")
-                    # 指数退避：先等待而不是立即刷新Cookie，减少频繁CDP调用
+                    # 指数退避：搜索/详情用短退避，投递用长退避
+                    is_search = (path in (self.SEARCH_URL, self.JOB_DETAIL_URL))
+                    if is_search:
+                        wait_37_list = [5, 10, 20]
+                    else:
+                        wait_37_list = [30, 60, 120]
                     if self._consecutive_37_count <= 3:
-                        wait_37 = [30, 60, 120][self._consecutive_37_count - 1]
+                        wait_37 = wait_37_list[self._consecutive_37_count - 1]
                         self._log(f"[{action}] {wait_37}秒后退避重试({self._consecutive_37_count}/3)...")
                         time.sleep(wait_37)
                         return self._api_get(path, params, action, retry_on_expire=False)
@@ -2055,7 +2060,7 @@ class BOSSApiClient:
                 elif code == 37:
                     self._consecutive_37_count += 1
                     self._log(f"[{action}] 需要重新验证(第{self._consecutive_37_count}次)")
-                    # 指数退避：先等待而不是立即刷新Cookie，减少频繁CDP调用
+                    # POST仅投递等操作，使用长退避保护
                     if self._consecutive_37_count <= 3:
                         wait_37 = [30, 60, 120][self._consecutive_37_count - 1]
                         self._log(f"[{action}] {wait_37}秒后退避重试({self._consecutive_37_count}/3)...")
