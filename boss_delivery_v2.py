@@ -3739,7 +3739,11 @@ class AutoDeliverWorker(QThread):
                     if page == 1:
                         self.log_signal.emit(_log_fmt("投递", "第1页无结果，请检查关键词或登录状态"))
                         break
-                    self.log_signal.emit(_log_fmt("投递", f"第{page}页无结果，搜索完成"))
+                    self.log_signal.emit(_log_fmt("投递",
+                        f"第{page}页无结果，搜索已用尽（已分析{enriched_count}个/投递{delivered_count}个/跳过{skipped_count}个）"))
+                    if delivered_count < self.target_count:
+                        self.log_signal.emit(_log_fmt("提示",
+                            f"目标{self.target_count}个未达标，建议：降低匹配度/更换关键词/扩大地区"))
                     break
 
                 new_jobs = self.db.filter_new_jobs(raw_jobs)
@@ -3749,7 +3753,11 @@ class AutoDeliverWorker(QThread):
                     consecutive_empty += 1
                     if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
                         self.log_signal.emit(_log_fmt("投递",
-                            f"连续{consecutive_empty}页均为已投递岗位，自动停止搜索"))
+                            f"连续{consecutive_empty}页均为已投递岗位，搜索已用尽"
+                            f"（已分析{enriched_count}个/投递{delivered_count}个/跳过{skipped_count}个）"))
+                        if delivered_count < self.target_count:
+                            self.log_signal.emit(_log_fmt("提示",
+                                f"目标{self.target_count}个未达标，建议：降低匹配度/更换关键词/扩大地区"))
                         break
                     self.log_signal.emit(_log_fmt("投递", f"第{page}页均为已投递岗位，翻页"))
                     page += 1
@@ -3870,8 +3878,18 @@ class AutoDeliverWorker(QThread):
         finally:
             executor.shutdown(wait=False)
 
+        # 汇总信息，明确告知用户原因
         self.log_signal.emit(_log_fmt("投递",
             f"[API模式] 结束 → 投递{delivered_count} 失败{failed_count} 跳过{skipped_count}"))
+        if not self._stop_flag and delivered_count < self.target_count:
+            shortfall = self.target_count - delivered_count
+            lines = []
+            lines.append(f"未达到目标{self.target_count}个，差额{shortfall}个")
+            if self.filter_active:
+                lines.append("（「仅投递刚刚活跃」已开启，大量非即时活跃岗位已被过滤）")
+            lines.append(f"可尝试：降低匹配度、放宽地区、更换关键词、关闭活跃筛选")
+            for line in lines:
+                self.log_signal.emit(_log_fmt("提示", line))
         self.all_done.emit(delivered_count, failed_count)
 
     def _run_browser_delivery(self):
