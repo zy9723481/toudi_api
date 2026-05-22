@@ -333,6 +333,7 @@ def _config_path(filename: str = "config.json") -> str:
 def save_delivery_config(keyword: str = "", location: str = "", min_score: int = 60,
                          target: int = 10, delay_min: int = 8, delay_max: int = 15,
                          delivery_mode: str = "api", use_greeting: bool = False,
+                         filter_active: bool = False,
                          resume_text: str = ""):
     """保存投递配置到 config.json（含简历文本）"""
     # 先加载已有数据（保留 resume_text 等不被覆盖）
@@ -353,6 +354,7 @@ def save_delivery_config(keyword: str = "", location: str = "", min_score: int =
         "delay_max": delay_max if delay_max != 15 or not existing else existing.get("delay_max", 15),
         "delivery_mode": delivery_mode or existing.get("delivery_mode", "api"),
         "use_greeting": use_greeting if use_greeting else existing.get("use_greeting", False),
+        "filter_active": filter_active if filter_active else existing.get("filter_active", False),
         "resume_text": resume_text or existing.get("resume_text", ""),
     }
     try:
@@ -3599,6 +3601,7 @@ class AutoDeliverWorker(QThread):
                  analyzer: ResumeAnalyzer, keyword: str, location: str,
                  min_score: int, target_count: int, use_ai_greeting: bool,
                  delivery_mode: str = "api",
+                 filter_active: bool = False,
                  platforms: list = None,
                  delay_min: int = MIN_DELAY_SECONDS, delay_max: int = MAX_DELAY_SECONDS,
                  browser_deliverer: BossBrowserDeliverer = None):
@@ -3612,6 +3615,7 @@ class AutoDeliverWorker(QThread):
         self.target_count = target_count
         self.use_ai_greeting = use_ai_greeting and delivery_mode == "browser"
         self.delivery_mode = delivery_mode
+        self.filter_active = filter_active
         self.platforms = platforms or ['boss']
         self.delay_min = delay_min
         self.delay_max = delay_max
@@ -3775,6 +3779,23 @@ class AutoDeliverWorker(QThread):
                             job["active_time"] = detail.get("active_time", 0)
                             job["active_time_desc"] = detail.get("active_time_desc", "")
                             detail_ok = True
+
+                    # 活跃筛选：仅投递「刚刚活跃」的岗位
+                    if self.filter_active and detail_ok:
+                        active_desc = job.get("active_time_desc", "")
+                        if active_desc and active_desc != "刚刚活跃":
+                            self.log_signal.emit(_log_fmt("投递",
+                                f"⊙ {job.get('title')}@{job.get('company')} "
+                                f"活跃描述为「{active_desc}」非「刚刚活跃」→ 跳过"))
+                            seen_urls.add(url)
+                            self.job_enriched.emit(url, job)
+                            self.db.add_job(
+                                job_url=url, title=job.get("title", ""),
+                                company=job.get("company", ""), status=5,
+                                match_score=job.get("match_score", 0),
+                                active_time=job.get("active_time", 0),
+                                active_time_desc=job.get("active_time_desc", ""))
+                            continue
 
                     if has_resume and job.get("job_detail"):
                         try:
@@ -4033,17 +4054,17 @@ class JobListTab(QWidget):
         header.setSectionResizeMode(7, QHeaderView.Fixed)
         header.setSectionResizeMode(8, QHeaderView.Stretch)
         header.setSectionResizeMode(9, QHeaderView.Fixed)
-        header.setSectionResizeMode(10, QHeaderView.Fixed)
+        header.setSectionResizeMode(10, QHeaderView.Interactive)
         header.setStretchLastSection(False)
         self.job_table.setColumnWidth(1, 80)
         self.job_table.setColumnWidth(2, 50)
         self.job_table.setColumnWidth(3, 65)
         self.job_table.setColumnWidth(4, 65)
-        self.job_table.setColumnWidth(5, 55)
+        self.job_table.setColumnWidth(5, 65)
         self.job_table.setColumnWidth(6, 48)
         self.job_table.setColumnWidth(7, 70)
         self.job_table.setColumnWidth(9, 50)
-        self.job_table.setColumnWidth(10, 50)
+        self.job_table.setColumnWidth(10, 70)
         self.job_table.setMinimumHeight(180)
         self.job_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.job_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -4289,6 +4310,14 @@ class AutoDeliveryTab(QWidget):
         param_grid.addLayout(delay_row, row, 1)
         row += 1
 
+        # --- 仅投递刚刚活跃 ---
+        param_grid.addWidget(QLabel("活跃筛选："), row, 0)
+        self.active_filter_check = QCheckBox("仅投递「刚刚活跃」的岗位（勾选后跳过非即时活跃岗位）")
+        self.active_filter_check.setChecked(False)
+        self.active_filter_check.setToolTip("勾选后，获取到岗位详情若非「刚刚活跃」则自动跳过，继续下一个岗位")
+        param_grid.addWidget(self.active_filter_check, row, 1)
+        row += 1
+
         # --- 招呼语 ---
         param_grid.addWidget(QLabel("招呼语："), row, 0)
         self.greeting_check = QCheckBox("使用 AI 个性化招呼语")
@@ -4388,15 +4417,19 @@ class AutoDeliveryTab(QWidget):
             self.greeting_check.setEnabled(True)
         if cfg.get("use_greeting") and cfg.get("delivery_mode") == "browser":
             self.greeting_check.setChecked(True)
+        if cfg.get("filter_active"):
+            self.active_filter_check.setChecked(True)
 
     def _save_config(self, keyword: str, location: str, min_score: int,
                      target: int, delay_min: int, delay_max: int,
-                     delivery_mode: str, use_greeting: bool):
+                     delivery_mode: str, use_greeting: bool,
+                     filter_active: bool = False):
         """保存当前投递配置到 config.json"""
         save_delivery_config(
             keyword=keyword, location=location, min_score=min_score,
             target=target, delay_min=delay_min, delay_max=delay_max,
-            delivery_mode=delivery_mode, use_greeting=use_greeting)
+            delivery_mode=delivery_mode, use_greeting=use_greeting,
+            filter_active=filter_active)
 
     def _on_mode_changed(self, btn):
         is_browser = (btn == self.browser_mode_radio)
@@ -4438,6 +4471,7 @@ class AutoDeliveryTab(QWidget):
         dmin = self.delay_min_spin.value()
         dmax = self.delay_max_spin.value()
         use_greeting = self.greeting_check.isChecked() and is_browser
+        filter_active = self.active_filter_check.isChecked()
 
         # 简历文本检查
         if not self.analyzer or not self.analyzer.resume_text:
@@ -4448,7 +4482,8 @@ class AutoDeliveryTab(QWidget):
         # 保存投递配置
         self._save_config(keyword=keyword, location=location, min_score=min_score,
                           target=target, delay_min=dmin, delay_max=dmax,
-                          delivery_mode=delivery_mode, use_greeting=use_greeting)
+                          delivery_mode=delivery_mode, use_greeting=use_greeting,
+                          filter_active=filter_active)
 
         mode_desc = "浏览器模式" if is_browser else "API模式"
         _log_emitter.log_signal.emit(_log_fmt(
@@ -4492,6 +4527,7 @@ class AutoDeliveryTab(QWidget):
             self.api_client, self.db, self.analyzer,
             keyword, location, min_score, target,
             use_greeting, delivery_mode=delivery_mode,
+            filter_active=filter_active,
             delay_min=dmin, delay_max=dmax,
             browser_deliverer=browser_deliverer
         )
